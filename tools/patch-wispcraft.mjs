@@ -8,7 +8,8 @@
  *      account has no Java profile (404) or the token/relay was rejected (401/403).
  *      This injects a helper that reports the HTTP status plus a cause hint.
  *   2. Built-in relay default - pins the bundle's fallback relay to the same value
- *      relays.js uses, so a replaced bundle does not quietly point somewhere else.
+ *      relays.js exports as DEFAULT, which is read from that file so a replaced bundle cannot
+ *      drift from the launcher (and --check needs no extra flag).
  *
  * Usage:
  *   node tools/patch-wispcraft.mjs                 # patch ./wispcraft.js
@@ -39,7 +40,19 @@ const opt = (name, fallback) => {
 };
 
 const file = path.resolve(opt("--file", "wispcraft.js"));
-const relayDefault = opt("--default-relay", "wss://anura.pro/");
+/* relays.js is the single source of truth for the default relay; the bundle's pinned fallback
+   follows it unless a caller is patching a copy against some other launcher. */
+function launcherRelayDefault() {
+  const candidates = [path.join(path.dirname(file), "relays.js"), path.resolve("relays.js")];
+  for (const candidate of candidates) {
+    try {
+      const found = fs.readFileSync(candidate, "utf8").match(/\bvar\s+DEFAULT\s*=\s*"([^"]+)"/);
+      if (found) return found[1];
+    } catch (err) { /* try the next location */ }
+  }
+  return null;
+}
+const relayDefault = opt("--default-relay", launcherRelayDefault() || "wss://anura.pro/");
 const checkOnly = flag("--check");
 
 let js;

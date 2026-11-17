@@ -4,7 +4,11 @@
    answers 401. Each duplicate only cost a socket and a slot in the pre-flight probe. */
 window.WispRelays = (function () {
   var KEY = "wispcraft_wispurl";
-  var DEFAULT = "wss://anura.pro/";
+  /* Used only until the player picks a relay. The list is ordered for reading, not precedence:
+     the launcher ranks relays by its own probe. Why this one, how it was measured and how to
+     refresh it are in PATCHES.md ("Relay default"); tools/patch-wispcraft.mjs reads this value
+     so the bundle's pinned fallback cannot drift from it. */
+  var DEFAULT = "wss://us-east.wisp.q13x.com/";
   var LIST = [
     "wss://anura.pro/",
     "wss://us-east.wisp.q13x.com/",
@@ -60,23 +64,78 @@ window.WispRelays = (function () {
 
   function clear() { try { localStorage.removeItem(KEY); } catch (e) {} }
 
-  /* A relay is usable if it accepts the WebSocket handshake. That is the same test the
-     game performs, and a timeout is reported as unreachable rather than as broken. */
+  /* A relay is only usable if it can carry traffic. Accepting the WebSocket handshake is not
+     enough: a relay can accept the socket and then never open a stream, which is how the old
+     "does it open?" test passed on relays that stalled in game. This opens a real TCP stream,
+     sends a request and waits for the reply, so a silent relay fails here instead.
+     Packets are [type][streamID u32 LE][payload]; the greeting's length says whether the stream
+     id is present (9 bytes) or the server speaks the older 5-byte layout. */
+  var TEST_HOST = "example.com";
+  var TEST_PORT = 80;
+  var TEST_REQUEST = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+  var CONTINUE = 0x03, DATA = 0x02, CLOSE = 0x04;
+
   function probe(url, timeout) {
     var target = normalize(url);
     return new Promise(function (resolve) {
       if (!target) return resolve({ url: String(url), ok: false, ms: 0 });
-      var started = Date.now(), done = false, ws = null, timer = null;
+      var started = Date.now(), done = false, ws = null, timer = null, greeting = null, sent = false;
       function finish(ok) {
         if (done) return;
         done = true;
         if (timer) clearTimeout(timer);
-        try { if (ws) ws.close(); } catch (e) {}
+        /* closing a socket that is still connecting logs a browser warning, so let a late open
+           close itself instead */
+        try { if (ws && ws.readyState === 1) ws.close(); } catch (e) {}
         resolve({ url: target, ok: ok, ms: Date.now() - started });
+      }
+      function hostBytes() {
+        var out = new Uint8Array(TEST_HOST.length);
+        for (var i = 0; i < TEST_HOST.length; i++) out[i] = TEST_HOST.charCodeAt(i);
+        return out;
+      }
+      function send() {
+        if (sent || done) return;
+        sent = true;
+        var framed = greeting !== "v1";
+        var connectHead = framed ? [0x01, 1, 0, 0, 0] : [0x01];
+        var dataHead = framed ? [0x02, 1, 0, 0, 0] : [0x02];
+        var connect = new Uint8Array(connectHead.length + 3 + TEST_HOST.length);
+        connect.set(connectHead, 0);
+        connect[connectHead.length] = 0x01;                       /* stream type: TCP */
+        connect[connectHead.length + 1] = TEST_PORT & 255;
+        connect[connectHead.length + 2] = (TEST_PORT >> 8) & 255;
+        connect.set(hostBytes(), connectHead.length + 3);
+        var request = new Uint8Array(dataHead.length + TEST_REQUEST.length);
+        request.set(dataHead, 0);
+        for (var i = 0; i < TEST_REQUEST.length; i++) {
+          request[dataHead.length + i] = TEST_REQUEST.charCodeAt(i) & 255;
+        }
+        try { ws.send(connect); ws.send(request); } catch (e) { finish(false); }
       }
       timer = setTimeout(function () { finish(false); }, timeout || 3500);
       try { ws = new WebSocket(target); } catch (e) { finish(false); return; }
-      ws.onopen = function () { finish(true); };
+      ws.binaryType = "arraybuffer";
+      /* servers that never greet get a best-effort CONNECT in the common layout */
+      ws.onopen = function () {
+        if (done) { try { ws.close(); } catch (e) {} return; }
+        setTimeout(send, 700);
+      };
+      ws.onmessage = function (ev) {
+        var d = new Uint8Array(ev.data);
+        if (d[0] === CONTINUE) {
+          if (!greeting) greeting = d.length >= 9 ? "v2" : "v1";
+          send();
+          return;
+        }
+        if (d[0] === DATA) {
+          var at = greeting === "v1" ? 1 : 5, head = "";
+          for (var i = 0; i < 5 && at + i < d.length; i++) head += String.fromCharCode(d[at + i]);
+          finish(head === "HTTP/");
+          return;
+        }
+        if (d[0] === CLOSE) finish(false);
+      };
       ws.onerror = function () { finish(false); };
       ws.onclose = function () { finish(false); };
     });

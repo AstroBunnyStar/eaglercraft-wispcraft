@@ -153,7 +153,7 @@
     </div>
     <p class="status" id="relaystatus"></p>
     <div class="relaylist" id="relaylist" hidden></div>
-    <p class="status">Save with the field empty to return to the default relay. Relays are probed from this browser, so a row that fails here fails for the game too. <b>Play</b> checks your relay first and switches only when it does not answer; once in game, change it live under <b>Wisp Settings → Wisp Server</b>.</p>
+    <p class="status">Save with the field empty to return to the default relay. Each check opens a real proxied connection through the relay and fetches a small page, so a relay that accepts the socket but stalls is marked as failing here. <b>Play</b> tests your relay first and switches to the fastest one that carries traffic; once in game, change it live under <b>Wisp Settings → Wisp Server</b>.</p>
   </section>
 
   <section class="warn">
@@ -204,7 +204,7 @@
       name.textContent = R.host(r.url);
       var ms = document.createElement("span");
       ms.className = "rms";
-      ms.textContent = r.ok ? r.ms + " ms" : "unreachable";
+      ms.textContent = r.ok ? r.ms + " ms" : "cannot proxy";
       var use = document.createElement("button");
       use.className = "ghost tiny";
       use.textContent = inUse ? "In use" : "Use";
@@ -243,12 +243,12 @@
     if (!R) return;
     var btn = this;
     btn.disabled = true;
-    status.textContent = "Probing relays…";
+    status.textContent = "Testing relays with a real proxied request…";
     status.className = "status";
     R.probeAll(3500).then(function (res) {
       results = res;
       var good = res.filter(function (x) { return x.ok; }).length;
-      status.textContent = good + " of " + res.length + " relays answered — click Use on one, or just press Play.";
+      status.textContent = good + " of " + res.length + " relays carried a test request — click Use on one, or just press Play.";
       status.className = "status" + (good ? " ok" : "");
       btn.disabled = false;
       renderList();
@@ -288,7 +288,7 @@
     launching = true;
     var href = this.getAttribute("href");
     function go() { location.href = href; }
-    status.textContent = "Checking your relay…";
+    status.textContent = "Checking your relay can carry traffic…";
     status.className = "status";
     R.probe(R.current(), 4000).then(function (res) {
       if (res.ok) return go();
@@ -299,7 +299,7 @@
           return go();
         }
         R.set(best.url);
-        status.textContent = "Saved relay did not answer — switched to " + R.host(best.url) + " (" + best.ms + " ms). Launching…";
+        status.textContent = "Saved relay could not carry traffic — switched to " + R.host(best.url) + " (" + best.ms + " ms). Launching…";
         status.className = "status ok";
         go();
       });
