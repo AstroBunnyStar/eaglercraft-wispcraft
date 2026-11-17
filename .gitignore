@@ -1,0 +1,6 @@
+.freebuff/
+threads/
+.tmp/
+play-test.html
+.github-token
+*.token
