@@ -71,8 +71,8 @@ minifiers rename it between builds.
 
 ## Relay default
 
-`relays.js` ships a fixed `DEFAULT` (`wss://us-east.wisp.q13x.com/`) instead of probing on every
-launch, because the probe is the wrong tool for choosing the first relay:
+`relays.js` ships a fixed `DEFAULT` (`wss://linuxontab-net.fly.dev/wisp/`) instead of probing on
+every launch, because the probe is the wrong tool for choosing the first relay:
 
 - a fixed default starts the game immediately on a first visit, with no 22-relay sweep first;
 - Play already tests the saved relay with a real proxied request and, only when that fails, sweeps
@@ -82,8 +82,18 @@ launch, because the probe is the wrong tool for choosing the first relay:
   player will actually join, so "always take the fastest" would still re-rank on noise and throw
   away a relay the player chose on purpose.
 
-Measured from this machine on 2026-11-17: five handshake probes each, then a real HTTP request through
-`@mercuryworkshop/wisp-js`, then a Minecraft status ping to Hypixel over the same stream.
+**Moved off `us-east.wisp.q13x.com` on 2026-11-18.** That relay stopped carrying traffic for
+everyone at once, not just for one network: the scheduled `relay.yml` run failed with
+`DOWN 922 ms  wss://us-east.wisp.q13x.com/` on GitHub's westus2 runner while 18 of 22 relays
+passed, and the same run had passed nine hours earlier. It is also the only relay in the list that
+refuses a TLS stream to `login.microsoftonline.com` - the client's sign-in then dies with
+`hyper ... tls handshake eof` and never issues a device code. `linuxontab-net.fly.dev` was the
+fastest survivor of that sweep (336 ms proxied on the runner) and the only relay that completed the
+Microsoft TLS handshake, so it is the new default.
+
+The table below is the original 2026-11-17 measurement that made `us-east` the default in the first
+place; five handshake probes each, then a real HTTP request through `@mercuryworkshop/wisp-js`, then
+a Minecraft status ping to Hypixel over the same stream.
 
 | relay | handshake | proxied HTTP | Hypixel ping |
 | --- | --- | --- | --- |
