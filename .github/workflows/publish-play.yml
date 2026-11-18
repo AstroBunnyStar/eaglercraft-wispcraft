@@ -1,0 +1,43 @@
+name: publish-play-page
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-play.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch play.html
+        run: |
+          set -euo pipefail
+          curl -fsSL -o play.html https://litter.catbox.moe/sgzr4g.html
+          echo "bb8a28860961172c6e988d87d8c80a1c88cf9b87dc08b9cff6b86e4f6df886f3  play.html" | sha256sum -c -
+
+      - name: Verify
+        run: |
+          set -euo pipefail
+          wc -c play.html
+          grep -q 'seedAccountSkin' play.html
+          grep -q 'profileHasSkin' play.html
+
+      - name: Commit
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add play.html
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+          else
+            git commit -m "Publish the profile-editor skin work in play.html" -m "The live game page now matches the launcher: the account's real skin is seeded into the profile editor, legacy 64x32 skins are converted with the client's own region copies, and the verified blob layout and Guest-name pin are unchanged."
+            git push
+          fi
