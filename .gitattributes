@@ -1,0 +1,8 @@
+# The site is served byte for byte from this repository and tools/verify-published.mjs
+# compares the served bytes against the working tree, so a checkout must never rewrite
+# line endings (core.autocrlf=true does, and quietly changes every hash).
+* text=auto eol=lf
+
+*.png binary
+*.epk binary
+*.wasm binary
