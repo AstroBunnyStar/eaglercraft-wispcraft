@@ -1,0 +1,43 @@
+name: apply
+
+# One-shot: land the edited sources after checking they are what was tested locally.
+on: workflow_dispatch
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Fetch the edited sources
+        run: |
+          curl -sSfL -o index.html https://litter.catbox.moe/z8f28v.html
+          curl -sSfL -o relays.js https://litter.catbox.moe/e33at9.js
+          curl -sSfL -o PATCHES.md https://litter.catbox.moe/9a8sad.md
+          echo "c22149e9fa9723e7d9fb021bb69dcad2e38be91d5fca795d6c342bfabc7c7d8d  index.html" | sha256sum -c -
+          echo "791aa5a4782cb770298b7c591f115ded4abb5240769cf07a99a1c82f7cab2bcc  relays.js" | sha256sum -c -
+          echo "a895ac5f36c8cbe2355074018cee0acc1b8cf35dadef9882fa3ea375fca2bd84  PATCHES.md" | sha256sum -c -
+
+      - name: Syntax and tests
+        run: |
+          node --check relays.js
+          node --test
+
+      - name: The bundle must already carry its patches
+        run: node tools/patch-wispcraft.mjs --check
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html relays.js PATCHES.md
+          if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
+          git commit -m "Prefer relays that can complete the sign-in handshake"
+          git push
