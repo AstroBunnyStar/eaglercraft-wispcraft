@@ -138,9 +138,14 @@ whole path (socket → stream → relay egress → data back) without TLS or a M
 That test alone cannot see the failure that hurts most, because it says nothing about whether the
 relay can reach Microsoft. Every probe therefore also opens a second stream, `probeSignIn()`: CONNECT
 to `login.microsoftonline.com:443`, queue a fixed 269-byte TLS 1.2 ClientHello straight away, and pass
-when any bytes come back — a ServerHello, or even an alert, proves a TLS record crossed in both
-directions. The hello is a captured constant, not something built in JS (a hand-built one is
-rejected), and it carries the SNI, so the same bytes work through every relay. `probe()` reports `ok`
+only when the reply starts with a **ServerHello** record (content type 22, handshake type 2). Any
+bytes are not enough: a TLS alert also proves a record crossed in both directions, but it means
+Microsoft refused the connection, so counting it would paint a relay green that cannot sign anyone
+in. An alert, plain text or a malformed record header fails the test as soon as it arrives, and a
+record split across DATA packets is accumulated until it can be classified. The hello is a captured
+constant, not something built in JS (a hand-built one is rejected), and it carries the SNI, so the
+same bytes work through every relay; `test/relays-signin.test.mjs` parses it and asserts the record
+lengths and the `login.microsoftonline.com` server name, so the constant cannot rot unnoticed. `probe()` reports `ok`
 (carried the test request) and `signin` (completed the sign-in handshake) separately: a relay that
 fails `signin` can still play, but it strands anyone who is not signed in yet. **Play** therefore
 prefers `signin` relays while the browser has no saved account, and the relay list labels the ones

@@ -81,15 +81,18 @@ window.WispRelays = (function () {
      `hyper ... tls handshake eof` with no device code at all - a failure the plain-HTTP check
      below cannot see. This sends a real TLS 1.2 ClientHello for login.microsoftonline.com
      (269 bytes, captured from a TLS stack, not hand-written: a hand-built one is rejected and
-     every relay then looks broken) and counts any bytes coming back as success. A ServerHello
-     proves the relay carried a TLS record in both directions, which is exactly what sign-in needs.
+     every relay then looks broken) and passes only on a ServerHello record. Counting any bytes
+     back is not enough: a TLS alert also crosses in both directions, so it would turn "Microsoft
+     refused this connection" into a green sign-in test the client cannot actually use.
      The hello is queued straight after CONNECT instead of after a CONTINUE on the new stream:
      several relays in LIST never send that CONTINUE, and waiting for it made healthy relays
-     time out. The host is in the hello's SNI, so one fixed byte string works for every relay. */
+     time out. The host is in the hello's SNI, so one fixed byte string works for every relay;
+     test/relays-signin.test.mjs parses the constant and fails if that stops being true. */
   var SIGNIN_HOST = "login.microsoftonline.com";
   var SIGNIN_PORT = 443;
   var SIGNIN_HELLO = "FgMBAQgBAAEEAwPPgliUqlculzk1Y/RCyWg74Vjrd+JEKS3hUuGPMQXuFgAAYsAvwCvAMMAsAJ7AJwBnwCgAawCjAJ/MqcyozKrArcCfwF3AYcBXwFMAosCswJ7AXMBgwFbAUsAkAGrAIwBAwArAFAA5ADjACcATADMAMgCdwJ3AUQCcwJzAUAA9ADwANQAvAQAAef8BAAEAAAAAHgAcAAAZbG9naW4ubWljcm9zb2Z0b25saW5lLmNvbQALAAQDAAECAAoADAAKAB0AFwAeABgAGQAjAAAAFgAAABcAAAANACoAKAQDBQMGAwgHCAgICQgKCAsIBAgFCAYEAQUBBgEDAwMBAwIEAgUCBgI=";
   var SIGNIN_BYTES = null;
+  var HANDSHAKE = 22, ALERT = 21;
 
   function helloBytes() {
     if (SIGNIN_BYTES) return SIGNIN_BYTES;
@@ -100,12 +103,30 @@ window.WispRelays = (function () {
     return out;
   }
 
-  /* Resolves ok:true only when the relay returned TLS bytes from Microsoft. */
+  /* Classifies the start of the reply stream: a TLS record header is 5 bytes, then the record
+     body. "serverhello" is the only pass; "alert" is a refusal and must not be mistaken for one;
+     "partial" means fewer bytes than a verdict needs, which happens when a relay splits the
+     record across DATA packets (so the caller must keep accumulating, not fail). */
+  function tlsVerdict(bytes) {
+    if (bytes.length < 6) return "partial";
+    var length = (bytes[3] << 8) | bytes[4];
+    if (bytes[0] === ALERT) return "alert";
+    if (bytes[0] !== HANDSHAKE || bytes[1] !== 3 || length < 4 || length > 18432) return "invalid";
+    if (bytes[5] !== 2) return "invalid";                 /* handshake type: ServerHello */
+    if (bytes.length < 9) return "partial";
+    var body = (bytes[6] << 16) | (bytes[7] << 8) | bytes[8];
+    if (body < 1 || body + 4 > length) return "invalid";
+    return "serverhello";
+  }
+
+  /* Resolves ok:true only when the relay returned the start of a real ServerHello from
+     Microsoft. An alert, plain text or a broken record header is a failure. */
   function probeSignIn(url, timeout) {
     var target = normalize(url);
     return new Promise(function (resolve) {
       if (!target) return resolve({ url: String(url), ok: false, ms: 0 });
       var started = Date.now(), done = false, ws = null, timer = null, sent = false;
+      var reply = new Uint8Array(0);
       function finish(ok) {
         if (done) return;
         done = true;
@@ -120,8 +141,14 @@ window.WispRelays = (function () {
       ws.onmessage = function (ev) {
         var d = new Uint8Array(ev.data);
         if (d[0] === DATA) {
-          /* any payload is a ServerHello or an alert: either way TLS arrived */
-          if (d.length > 5 && sent) finish(true);
+          if (!sent || d.length <= 5) return;
+          var next = new Uint8Array(reply.length + d.length - 5);
+          next.set(reply, 0);
+          next.set(d.subarray(5), reply.length);
+          reply = next;
+          var verdict = tlsVerdict(reply);
+          if (verdict === "serverhello") finish(true);
+          else if (verdict === "alert" || verdict === "invalid" || reply.length > 4096) finish(false);
           return;
         }
         if (d[0] === CLOSE) { finish(false); return; }
@@ -240,5 +267,6 @@ window.WispRelays = (function () {
 
   return { DEFAULT: DEFAULT, host: host, stored: stored, current: current,
            set: set, clear: clear, probe: probe, probeSignIn: probeSignIn,
-           probeAll: probeAll };
+           probeAll: probeAll, signinHost: SIGNIN_HOST, signinHello: helloBytes,
+           tlsVerdict: tlsVerdict };
 })();
