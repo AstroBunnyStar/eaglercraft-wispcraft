@@ -56,14 +56,22 @@ const tlsAlert = () => Buffer.from([21, 3, 3, 0, 2, 2, 40]);
 
 /* ------------------------------------------------------------- fake relay ---- */
 
-/** Replies with the stream-0 greeting, then with `pendingReplies` once CONNECT + hello go out. */
-let pendingReplies = [];
+const HTTP_REPLY = packet(DATA, 1, Buffer.from("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+
+/**
+ * Replies with the stream-0 greeting, then answers the first CONNECT: on port 443 with the next
+ * sign-in scenario (each attempt takes the next entry), on port 80 with a plain HTTP reply.
+ */
+let scenario = { signin: [], traffic: true };
+let signinAttempts = 0;
+
 class FakeSocket {
   constructor(url) {
     this.url = url;
     this.readyState = 0;
     this.sent = [];
-    this.replies = pendingReplies;
+    this.stream = null;
+    this.replies = [];
     FakeSocket.last = this;
     queueMicrotask(() => {
       if (this.readyState === 3) return;
@@ -74,6 +82,12 @@ class FakeSocket {
   }
   send(bytes) {
     this.sent.push(Buffer.from(bytes));
+    if (!this.stream) {
+      this.stream = this.sent[0].readUInt16LE(6) === 443 ? "signin" : "traffic";
+      this.replies = this.stream === "signin"
+        ? scenario.signin[signinAttempts++] || []
+        : (scenario.traffic ? [HTTP_REPLY] : []);
+    }
     if (this.sent.length === 2) this.deliver(this.replies);
   }
   close() { this.readyState = 3; }
@@ -94,10 +108,20 @@ function load() {
 }
 
 async function probe(replies, timeout = 500) {
-  pendingReplies = replies;
+  scenario = { signin: [replies], traffic: true };
+  signinAttempts = 0;
   const relays = load();
   const result = await relays.probeSignIn("wss://relay.example/wisp/", timeout);
   return { result, socket: FakeSocket.last, relays };
+}
+
+/** Runs the full probe (traffic + sign-in) with one reply list per sign-in attempt. */
+async function fullRelay(signinTries, { traffic = true, timeout = 500 } = {}) {
+  scenario = { signin: signinTries, traffic };
+  signinAttempts = 0;
+  const relays = load();
+  const result = await relays.probe("wss://relay.example/wisp/", timeout);
+  return { result, attempts: signinAttempts, relays };
 }
 
 /* --------------------------------------------------------- ClientHello parsing ---- */
@@ -183,6 +207,36 @@ test("a TLS alert is a refusal, not a completed handshake", async () => {
   const { result } = await probe([packet(DATA, 1, tlsAlert())]);
 
   assert.equal(result.ok, false, "an alert means Microsoft refused the connection");
+});
+
+test("a failed sign-in handshake is retried once and the retry decides", async () => {
+  const { result, attempts } = await fullRelay([[packet(DATA, 1, tlsAlert())], [packet(DATA, 1, serverHello())]]);
+
+  assert.equal(attempts, 2, "the alert was retried, not believed");
+  assert.equal(result.ok, true, "traffic still passes");
+  assert.equal(result.signin, true, "the second handshake succeeded");
+});
+
+test("a relay is labelled sign-in fails only after both attempts fail", async () => {
+  const { result, attempts } = await fullRelay([[packet(DATA, 1, tlsAlert())], [packet(DATA, 1, tlsAlert())]]);
+
+  assert.equal(attempts, 2, "exactly one retry, no loop");
+  assert.equal(result.signin, false, "two failures are evidence");
+});
+
+test("a relay that signs in first time is not retried", async () => {
+  const { result, attempts } = await fullRelay([[packet(DATA, 1, serverHello())], [packet(DATA, 1, tlsAlert())]]);
+
+  assert.equal(attempts, 1, "no second handshake");
+  assert.equal(result.signin, true);
+});
+
+test("a relay that cannot proxy is not retried for sign-in", async () => {
+  const { result, attempts } = await fullRelay([[packet(DATA, 1, tlsAlert())], [packet(DATA, 1, serverHello())]], { traffic: false });
+
+  assert.equal(attempts, 1, "traffic already failed, so sign-in cannot count");
+  assert.equal(result.ok, false);
+  assert.equal(result.signin, false);
 });
 
 test("plain text and a handshake that is not a ServerHello both fail", async () => {

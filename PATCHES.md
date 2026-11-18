@@ -145,7 +145,13 @@ in. An alert, plain text or a malformed record header fails the test as soon as 
 record split across DATA packets is accumulated until it can be classified. The hello is a captured
 constant, not something built in JS (a hand-built one is rejected), and it carries the SNI, so the
 same bytes work through every relay; `test/relays-signin.test.mjs` parses it and asserts the record
-lengths and the `login.microsoftonline.com` server name, so the constant cannot rot unnoticed. `probe()` reports `ok`
+lengths and the `login.microsoftonline.com` server name, so the constant cannot rot unnoticed.
+
+A failed handshake is retried once (with a shorter 3 s budget) before the relay is labelled
+*sign-in fails*: a single reset mid-handshake is not evidence that the relay cannot sign anyone in,
+and a wrong demotion hides a working relay from every signed-out player. The retry only runs when
+the relay carried the traffic test, so a relay that cannot proxy at all is still tested once, and
+`probeAll()`'s fallback deadline is long enough to wait for it instead of dropping the relay. `probe()` reports `ok`
 (carried the test request) and `signin` (completed the sign-in handshake) separately: a relay that
 fails `signin` can still play, but it strands anyone who is not signed in yet. **Play** therefore
 prefers `signin` relays while the browser has no saved account, and the relay list labels the ones

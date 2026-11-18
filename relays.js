@@ -232,7 +232,13 @@ window.WispRelays = (function () {
 
   /* A relay is usable when it carries traffic; it is *preferable* when it can also complete the
      sign-in handshake, because a relay that passes only the first test strands anyone who is not
-     already signed in. `signin` reports the second test and never downgrades `ok`. */
+     already signed in. `signin` reports the second test and never downgrades `ok`.
+     A failed handshake is retried once: a reset mid-handshake or a relay hiccup says nothing about
+     whether sign-in works, and demoting a working relay hides it from every signed-out player. The
+     retry runs only when the relay carried traffic, so a relay that cannot proxy at all is tested
+     once. Worst case is budget + SIGNIN_RETRY_MS, which probeAll's deadline allows for. */
+  var SIGNIN_RETRY_MS = 3000;
+
   function probe(url, timeout) {
     var target = normalize(url);
     return new Promise(function (resolve) {
@@ -240,11 +246,16 @@ window.WispRelays = (function () {
       /* Both streams open at once: run in sequence and the sign-in test inherits a budget already
          spent by the traffic test, which marked healthy relays as unable to sign in. The sign-in
          test gets the larger budget because a slow relay still answers in ~3 s. */
+      var budget = Math.max(timeout || 3500, 5000);
       var traffic = probeTraffic(target, timeout);
-      var signin = probeSignIn(target, Math.max(timeout || 3500, 5000));
+      var signin = probeSignIn(target, budget);
       traffic.then(function (t) {
         signin.then(function (s) {
-          resolve({ url: target, ok: !!t.ok, ms: t.ms, signin: !!t.ok && !!s.ok, signinMs: s.ms });
+          var result = { url: target, ok: !!t.ok, ms: t.ms, signin: !!t.ok && !!s.ok, signinMs: s.ms };
+          if (result.signin || !t.ok) return resolve(result);
+          probeSignIn(target, SIGNIN_RETRY_MS).then(function (retry) {
+            resolve({ url: target, ok: true, ms: t.ms, signin: !!retry.ok, signinMs: retry.ms });
+          });
         });
       });
     });
@@ -260,8 +271,9 @@ window.WispRelays = (function () {
       LIST.forEach(function (u, i) {
         probe(u, t).then(function (r) { out[i] = r; if (--left === 0) finish(); });
       });
-      /* the chain above can need longer than one probe timeout; resolving early drops relays */
-      setTimeout(finish, Math.max(t + 500, 5500));
+      /* the chain above can need longer than one probe timeout - a failed handshake is retried -
+         and resolving early drops relays from the list, so the fallback must clear the retry too */
+      setTimeout(finish, Math.max(t + 500, 9000));
     });
   }
 
