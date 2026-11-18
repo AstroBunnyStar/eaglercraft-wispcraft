@@ -3,7 +3,8 @@
  *   - a fresh profile gets the account's skin seeded, exactly once;
  *   - a profile that already carries a skin is never rewritten;
  *   - with no cached profile there is nothing to seed;
- *   - a legacy 64x32 skin is completed with the client's own 13 region copies.
+ *   - a legacy 64x32 skin is completed with the client's own 13 region copies;
+ *   - the checked-in legacy fixtures still match tools/make-legacy-fixtures.mjs.
  *
  * The head script is extracted from play.html at run time, so this test tracks the real
  * client rather than a copy of it. Run with: node --test test/
@@ -14,6 +15,8 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import zlib from "node:zlib";
+
+import { expectedJson, legacyPixels } from "../tools/make-legacy-fixtures.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const PLAY = path.join(ROOT, "play.html");
@@ -217,4 +220,19 @@ test("legacy 64x32 skin is completed exactly as the client's converter does", as
   assert.equal(len, SKIN_BYTES, "legacy skin expanded to 64x64");
   const mismatched = expected.findIndex((byte, i) => bytes[i] !== byte);
   assert.equal(mismatched, -1, `first mismatching byte at offset ${mismatched}`);
+});
+
+test("checked-in legacy fixtures match the tracked generator", () => {
+  const png = decodePng(fs.readFileSync(path.join(FIXTURES, "legacy64x32.png")));
+  assert.deepEqual([png.width, png.height], [64, 32], "fixture is a legacy skin");
+
+  const pixels = legacyPixels();
+  const drift = pixels.findIndex((byte, i) => png.data[i] !== byte);
+  assert.equal(drift, -1, `legacy64x32.png differs from the generator at byte ${drift}`);
+
+  const onDisk = fs.readFileSync(path.join(FIXTURES, "legacy-expected.json"), "utf8");
+  assert.ok(
+    onDisk === expectedJson(),
+    "legacy-expected.json is stale; run node tools/make-legacy-fixtures.mjs",
+  );
 });
