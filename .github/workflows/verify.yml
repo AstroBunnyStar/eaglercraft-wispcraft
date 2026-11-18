@@ -1,0 +1,34 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Scripts parse
+        run: |
+          set -euo pipefail
+          node --check relays.js
+          node --check wispcraft.js
+          node --check tools/patch-wispcraft.mjs
+          node --check tools/check-launcher.mjs
+
+      - name: Launcher inline script parses
+        run: node tools/check-launcher.mjs
+
+      - name: Bundle default matches relays.js
+        run: node tools/patch-wispcraft.mjs --check
