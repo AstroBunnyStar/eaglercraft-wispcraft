@@ -12,12 +12,18 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # the test command has to work on every supported Node: `node --test <dir>` was
+        # rejected on 24, so discovery stays argument-free
+        node: ["20", "22", "24"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: ${{ matrix.node }}
 
       - name: Scripts parse
         run: |
@@ -26,12 +32,14 @@ jobs:
           node --check wispcraft.js
           node --check tools/patch-wispcraft.mjs
           node --check tools/check-launcher.mjs
+          node --check tools/make-legacy-fixtures.mjs
+          node --check tools/verify-published.mjs
 
       - name: Launcher inline script parses
         run: node tools/check-launcher.mjs
 
       - name: Tests
-        run: node --test test/
+        run: node --test
 
       - name: Bundle default matches relays.js
         run: node tools/patch-wispcraft.mjs --check

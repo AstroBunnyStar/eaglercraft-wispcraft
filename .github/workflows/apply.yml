@@ -21,20 +21,16 @@ jobs:
           set -euo pipefail
           curl -fsS -o test/seed-and-blob.test.mjs https://litter.catbox.moe/ksg2vp.mjs
           curl -fsS -o tools/verify-published.mjs https://litter.catbox.moe/b2swju.mjs
-          curl -fsS -o .github/workflows/verify.yml https://litter.catbox.moe/e9h6as.yml
           echo "9e7b1379668bcab1a4a96913e71e810c887559063333ec47d2930f1e0fb66067  test/seed-and-blob.test.mjs" | sha256sum -c -
           echo "27b15229b43512f127fdff2077339fa0dfbd123ffa17d5232598f3cd6ac56d1e  tools/verify-published.mjs" | sha256sum -c -
-          echo "8c65c5692bc25b1d7ee9a62eadd3a09224dcd740266c289f10ad3ad252f410cc  .github/workflows/verify.yml" | sha256sum -c -
 
       - name: Check and commit
         run: |
           set -euo pipefail
           node --test
-          node --check tools/verify-published.mjs
           node tools/verify-published.mjs
-          node tools/patch-wispcraft.mjs --check
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add test/seed-and-blob.test.mjs tools/verify-published.mjs .github/workflows/verify.yml
-          git commit -m "Guard the guest-name pin and reload budget, and check what Pages serves"
+          git add test/seed-and-blob.test.mjs tools/verify-published.mjs
+          git commit -m "Test the guest-name pin, fetch failure, reload budget and account survival"
           git push
