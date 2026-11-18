@@ -1,13 +1,17 @@
 /**
- * Guards the profile-editor skin work in play.html:
+ * Guards the identity and skin seeding the head script in play.html performs:
  *   - a fresh profile gets the account's skin seeded, exactly once;
  *   - a profile that already carries a skin is never rewritten;
  *   - with no cached profile there is nothing to seed;
  *   - a legacy 64x32 skin is completed with the client's own 13 region copies;
- *   - the checked-in legacy fixtures still match tools/make-legacy-fixtures.mjs.
+ *   - the checked-in legacy fixtures still match tools/make-legacy-fixtures.mjs;
+ *   - a guest name the engine writes during boot cannot replace the account's;
+ *   - a texture that cannot be fetched leaves the profile alone;
+ *   - the seeded reload happens at most once per session;
+ *   - seeding never rewrites or drops the stored accounts.
  *
  * The head script is extracted from play.html at run time, so this test tracks the real
- * client rather than a copy of it. Run with: node --test test/
+ * client rather than a copy of it. Run with: node --test
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -23,6 +27,7 @@ const PLAY = path.join(ROOT, "play.html");
 const FIXTURES = path.join(ROOT, "test", "fixtures");
 
 const ACCOUNT = "Lunamix_";
+const GUEST = "Guest_71c8cc41";
 const TEXTURE = "http://textures.minecraft.net/texture/aa7e06956482c2e36150d947acd643a3933d5a95e738acd8f61e952ad470e14f";
 const BLOB_BYTES = 16573;
 const SKIN_BYTES = 16384;
@@ -105,7 +110,12 @@ const solidSkin = () => new Uint8ClampedArray(64 * 64 * 4).fill(0x7f);
  * buffer, so a 64x32 buffer exercises the legacy conversion. Timers stay inert: the test
  * measures the first boot, not the sign-in watcher.
  */
-function run(entries, pixels = solidSkin()) {
+function run(entries, {
+  pixels = solidSkin(),
+  bitmap,
+  session = [],
+  response = { ok: true, status: 200, blob: () => null },
+} = {}) {
   const stats = { fetches: 0, reloads: 0 };
   const localStorage = new Storage(entries);
   const context = {
@@ -113,7 +123,7 @@ function run(entries, pixels = solidSkin()) {
     btoa,
     atob,
     localStorage,
-    sessionStorage: new Storage(),
+    sessionStorage: new Storage(session),
     window: { wispcraft: { authstore: { user: { name: ACCOUNT, skins: [{ state: "ACTIVE", url: TEXTURE, variant: "SLIM" }] } } } },
     document: {
       readyState: "complete",
@@ -130,15 +140,15 @@ function run(entries, pixels = solidSkin()) {
       },
     },
     location: { protocol: "https:", reload() { stats.reloads++; } },
-    fetch: () => { stats.fetches++; return Promise.resolve({ ok: true, blob: () => null }); },
-    createImageBitmap: () => Promise.resolve({ width: 64, height: pixels.length / (64 * 4) }),
+    fetch: () => { stats.fetches++; return Promise.resolve(response); },
+    createImageBitmap: () => Promise.resolve(bitmap || { width: 64, height: pixels.length / (64 * 4) }),
     setTimeout: () => 0,
     setInterval: () => 0,
     clearInterval() {},
   };
   vm.createContext(context);
   vm.runInContext(headScript(), context, { filename: "play.html head" });
-  return { stats, blob: () => localStorage.getItem("_eaglercraftX.p") };
+  return { stats, localStorage, blob: () => localStorage.getItem("_eaglercraftX.p") };
 }
 
 const accountEntries = () => [
@@ -158,6 +168,20 @@ function skinOf(b64) {
   assert.ok(at > -1, "blob carries a data field");
   const len = i32(raw, at + 7);
   return { raw, len, bytes: Buffer.from(raw.substr(at + 11, len), "latin1") };
+}
+
+/** Rewrites the blob's username field the way a stale guest profile would carry it. */
+function renameInBlob(b64, name) {
+  const raw = latin1(b64);
+  const sig = "\u0008\u0000\u0008username";
+  const at = raw.indexOf(sig);
+  assert.ok(at > -1, "blob carries a username field");
+  const lenAt = at + sig.length;
+  return btoa(
+    raw.slice(0, lenAt) +
+    String.fromCharCode((name.length >> 8) & 255, name.length & 255) + name +
+    raw.slice(lenAt + 2 + ((raw.charCodeAt(lenAt) << 8) | raw.charCodeAt(lenAt + 1)))
+  );
 }
 
 /* ---------------------------------------------------------------------- tests ---- */
@@ -213,7 +237,7 @@ test("legacy 64x32 skin is completed exactly as the client's converter does", as
   const expected = Buffer.from(JSON.parse(fs.readFileSync(path.join(FIXTURES, "legacy-expected.json"), "utf8")).argb, "base64");
   assert.equal(expected.length, SKIN_BYTES, "reference skin is 16,384 bytes");
 
-  const client = run(accountEntries(), new Uint8ClampedArray(png.data));
+  const client = run(accountEntries(), { pixels: new Uint8ClampedArray(png.data) });
   await settle();
 
   const { len, bytes } = skinOf(client.blob());
@@ -235,4 +259,48 @@ test("checked-in legacy fixtures match the tracked generator", () => {
     onDisk === expectedJson(),
     "legacy-expected.json is stale; run node tools/make-legacy-fixtures.mjs",
   );
+});
+
+test("a guest name written during boot cannot replace the account's", async () => {
+  const client = run(accountEntries());
+  await settle();
+  const seeded = client.blob();
+  const store = client.localStorage;
+
+  store.setItem("_eaglercraftX.username", btoa(GUEST));
+  assert.equal(latin1(store.getItem("_eaglercraftX.username")), ACCOUNT, "guest write is pinned");
+
+  store.setItem("_eaglercraftX.username", "");
+  assert.equal(latin1(store.getItem("_eaglercraftX.username")), ACCOUNT, "blank write is pinned too");
+
+  store.setItem("_eaglercraftX.p", renameInBlob(seeded, GUEST));
+  assert.equal(store.getItem("_eaglercraftX.p"), seeded, "guest name in the blob is rewritten back");
+});
+
+test("a texture that cannot be fetched leaves the profile alone", async () => {
+  const client = run(accountEntries(), { response: { ok: false, status: 500, blob: () => null } });
+  await settle();
+
+  assert.equal(client.stats.fetches, 1, "one attempt, no retry loop");
+  assert.equal(client.stats.reloads, 0, "nothing to reload for");
+  assert.ok(!latin1(client.blob()).includes("\u0007\u0000\u0004data"), "no skin is invented");
+});
+
+test("the seeded reload happens at most once per session", async () => {
+  const client = run(accountEntries(), { session: [["wispcraft_skin_reloaded", "1"]] });
+  await settle();
+
+  assert.equal(skinOf(client.blob()).len, SKIN_BYTES, "the skin is still written");
+  assert.equal(client.stats.reloads, 0, "no second reload in the same session");
+});
+
+test("seeding never rewrites or drops the stored accounts", async () => {
+  const entries = accountEntries();
+  const seeded = run(entries);
+  await settle();
+  assert.equal(seeded.localStorage.getItem("wispcraft_accounts"), entries[0][1], "account list untouched");
+
+  const failing = run(entries, { response: { ok: false, status: 401, blob: () => null } });
+  await settle();
+  assert.equal(failing.localStorage.getItem("wispcraft_accounts"), entries[0][1], "a failed refresh keeps the account");
 });
