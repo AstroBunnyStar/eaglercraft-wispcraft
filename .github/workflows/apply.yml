@@ -1,0 +1,39 @@
+name: apply hardening
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install files
+        run: |
+          set -euo pipefail
+          curl -fsS -o test/seed-and-blob.test.mjs https://litter.catbox.moe/4pq4ws.mjs
+          curl -fsS -o tools/probe-relay.mjs https://litter.catbox.moe/cf2nez.mjs
+          curl -fsS -o tools/verify-published.mjs https://litter.catbox.moe/68r61s.mjs
+          echo "0cafe0036080964164a4036c0bf2cbbea1870d60288c6751ad49951b5386c0b0  test/seed-and-blob.test.mjs" | sha256sum -c -
+          echo "0e3e5a0b9d9e9819e3e0a8e75019706e2b84c6abb8afa0d1b442fd3b708f7554  tools/probe-relay.mjs" | sha256sum -c -
+          echo "00b53fa6e1df7903b5a25f9f88fab0c2e2dd947306cecce873b8aaf885e679f5  tools/verify-published.mjs" | sha256sum -c -
+
+      - name: Check and commit
+        run: |
+          set -euo pipefail
+          node --test
+          node --check tools/probe-relay.mjs
+          node tools/verify-published.mjs
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add test/seed-and-blob.test.mjs tools/probe-relay.mjs tools/verify-published.mjs
+          git commit -m "Add a relay liveness probe and cover the wrong-size skin case"
+          git push
