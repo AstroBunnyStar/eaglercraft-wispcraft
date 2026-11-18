@@ -7,6 +7,7 @@
  *   - the checked-in legacy fixtures still match tools/make-legacy-fixtures.mjs;
  *   - a guest name the engine writes during boot cannot replace the account's;
  *   - a texture that cannot be fetched leaves the profile alone;
+ *   - a skin that is not 64 wide is ignored;
  *   - the seeded reload happens at most once per session;
  *   - seeding never rewrites or drops the stored accounts.
  *
@@ -284,6 +285,14 @@ test("a texture that cannot be fetched leaves the profile alone", async () => {
   assert.equal(client.stats.fetches, 1, "one attempt, no retry loop");
   assert.equal(client.stats.reloads, 0, "nothing to reload for");
   assert.ok(!latin1(client.blob()).includes("\u0007\u0000\u0004data"), "no skin is invented");
+});
+
+test("a skin of the wrong size is ignored", async () => {
+  const client = run(accountEntries(), { bitmap: { width: 32, height: 32 } });
+  await settle();
+
+  assert.equal(client.stats.reloads, 0, "nothing to reload for");
+  assert.ok(!latin1(client.blob()).includes("\u0007\u0000\u0004data"), "the resized texture is not stored");
 });
 
 test("the seeded reload happens at most once per session", async () => {

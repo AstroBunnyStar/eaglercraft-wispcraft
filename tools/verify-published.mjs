@@ -21,7 +21,14 @@ const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const size = (n) => n.toLocaleString("en-US");
 
-const origin = new URL(process.argv[2] || DEFAULT_ORIGIN);
+const origin = (() => {
+  try {
+    return new URL(process.argv[2] || DEFAULT_ORIGIN);
+  } catch {
+    console.error(`not a URL: ${process.argv[2]}\nusage: node tools/verify-published.mjs [https://host/path/]`);
+    process.exit(2);
+  }
+})();
 if (!origin.pathname.endsWith("/")) origin.pathname += "/";
 
 let failures = 0;
@@ -35,7 +42,7 @@ for (const file of FILES) {
     served = Buffer.from(await res.arrayBuffer());
   } catch (error) {
     failures++;
-    console.log(`MISSING  ${file.padEnd(13)} ${local.length === 0 ? "" : `${size(local.length)} B local`}  ${error.message}`);
+    console.log(`MISSING  ${file.padEnd(13)} local ${size(local.length)} B  ${error.message}`);
     continue;
   }
 
