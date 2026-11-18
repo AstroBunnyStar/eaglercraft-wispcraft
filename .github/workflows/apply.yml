@@ -1,0 +1,42 @@
+name: apply
+
+# One-shot: land the edited sources, re-pin the bundle fallback from relays.js, commit.
+on: workflow_dispatch
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Fetch the edited sources
+        run: |
+          curl -sSfL -o relays.js https://litter.catbox.moe/psn4bn.js
+          curl -sSfL -o PATCHES.md https://litter.catbox.moe/ks4a0z.md
+          echo "d8bf2fd557baa92db86aceeed1bee12191c00e4b247eca4af3b99e2946311542  relays.js" | sha256sum -c -
+          echo "c277b4c3fdf455e5b7e1194aa3e143fbc94473783e0f48d2a92e3450a89d2b75  PATCHES.md" | sha256sum -c -
+
+      - name: Re-pin the bundle fallback from relays.js
+        run: |
+          node tools/patch-wispcraft.mjs
+          node tools/patch-wispcraft.mjs --check
+          node --check wispcraft.js
+
+      - name: Tests
+        run: node --test
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add relays.js PATCHES.md wispcraft.js
+          if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
+          git commit -m "Point the default relay at one that carries traffic and can sign in"
+          git push
