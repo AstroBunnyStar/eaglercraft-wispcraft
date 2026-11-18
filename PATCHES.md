@@ -85,11 +85,20 @@ every launch, because the probe is the wrong tool for choosing the first relay:
 **Moved off `us-east.wisp.q13x.com` on 2026-11-18.** That relay stopped carrying traffic for
 everyone at once, not just for one network: the scheduled `relay.yml` run failed with
 `DOWN 922 ms  wss://us-east.wisp.q13x.com/` on GitHub's westus2 runner while 18 of 22 relays
-passed, and the same run had passed nine hours earlier. It is also the only relay in the list that
-refuses a TLS stream to `login.microsoftonline.com` - the client's sign-in then dies with
-`hyper ... tls handshake eof` and never issues a device code. `linuxontab-net.fly.dev` was the
-fastest survivor of that sweep (336 ms proxied on the runner) and the only relay that completed the
-Microsoft TLS handshake, so it is the new default.
+passed, and the same run had passed nine hours earlier. It is also the only relay seen to refuse a
+TLS stream to `login.microsoftonline.com` outright: the client's sign-in through it dies with
+`hyper ... tls handshake eof` and never issues a device code, while the same client, freshly loaded
+with the account store emptied, shows a code within 12-18 s through `linuxontab-net`, `truffled.lol`
+and `anura.pro`. `linuxontab-net.fly.dev` was the fastest survivor of that sweep (336 ms proxied on
+the runner) and completes the Microsoft handshake, so it is the new default.
+
+An earlier version of the TLS probe described below claimed that *only* `linuxontab-net` could
+handshake, which was wrong. It built the ClientHello by hand and waited for a CONTINUE on the new
+stream: Microsoft rejects the hand-built hello (the direct control died with `ECONNRESET`), and
+several relays never send that CONTINUE, so healthy relays looked dead and the one that sends it did
+not. The probe now replays a ClientHello captured from a real TLS stack and queues it immediately
+after CONNECT. That reproduces the client exactly: ServerHello through every relay that can sign in,
+`closed` through `us-east`.
 
 The table below is the original 2026-11-17 measurement that made `us-east` the default in the first
 place; five handshake probes each, then a real HTTP request through `@mercuryworkshop/wisp-js`, then
@@ -123,10 +132,22 @@ after launch.
 
 **Play** tests the saved relay once; if that fails it sweeps the whole list in parallel and switches
 to the fastest relay that carried the test request. **Check relays** runs the same sweep on demand.
-The target is deliberately a plain HTTP host: Wisp is protocol-agnostic, so a reply proves the whole
-path (socket → stream → relay egress → data back) without TLS or a Minecraft handshake.
+The traffic target is deliberately a plain HTTP host: Wisp is protocol-agnostic, so a reply proves the
+whole path (socket → stream → relay egress → data back) without TLS or a Minecraft handshake.
 
-To refresh: probe from a browser (the launcher's **Check relays** now runs the proxied test), update
+That test alone cannot see the failure that hurts most, because it says nothing about whether the
+relay can reach Microsoft. Every probe therefore also opens a second stream, `probeSignIn()`: CONNECT
+to `login.microsoftonline.com:443`, queue a fixed 269-byte TLS 1.2 ClientHello straight away, and pass
+when any bytes come back — a ServerHello, or even an alert, proves a TLS record crossed in both
+directions. The hello is a captured constant, not something built in JS (a hand-built one is
+rejected), and it carries the SNI, so the same bytes work through every relay. `probe()` reports `ok`
+(carried the test request) and `signin` (completed the sign-in handshake) separately: a relay that
+fails `signin` can still play, but it strands anyone who is not signed in yet. **Play** therefore
+prefers `signin` relays while the browser has no saved account, and the relay list labels the ones
+that cannot sign in. `us-east.wisp.q13x.com` is the case this exists for: its sign-in stream closed
+while its plain-HTTP test still answered on some sweeps.
+
+To refresh: probe from a browser (the launcher's **Check relays** now runs both tests), update
 `DEFAULT` in `relays.js`, then run `node tools/patch-wispcraft.mjs` so the bundle follows.
 
 Note this is only the last-resort fallback: in normal use the launcher's **Play** pre-flight writes

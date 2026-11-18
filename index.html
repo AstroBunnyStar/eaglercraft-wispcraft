@@ -153,7 +153,7 @@
     </div>
     <p class="status" id="relaystatus"></p>
     <div class="relaylist" id="relaylist" hidden></div>
-    <p class="status">Save with the field empty to return to the default relay. Each check opens a real proxied connection through the relay and fetches a small page, so a relay that accepts the socket but stalls is marked as failing here. <b>Play</b> tests your relay first and switches to the fastest one that carries traffic; once in game, change it live under <b>Wisp Settings → Wisp Server</b>.</p>
+    <p class="status">Save with the field empty to return to the default relay. Each check opens a real proxied connection and does two things: fetches a small page, and sends a TLS handshake to <code>login.microsoftonline.com</code> through the relay. A relay that accepts the socket but stalls fails the first test; one that carries traffic but cannot reach Microsoft fails the second and is listed as <b>sign-in fails</b>, because signing in through it dies with <code>tls handshake eof</code> and never shows a code. <b>Play</b> tests your relay first and, while you are still signed out, switches to the fastest relay that passes both; once in game, change it live under <b>Wisp Settings → Wisp Server</b>.</p>
   </section>
 
   <section class="warn">
@@ -192,6 +192,7 @@
     var cur = R.current();
     results.slice().sort(function (a, b) {
       if (a.ok !== b.ok) return a.ok ? -1 : 1;
+      if (!!a.signin !== !!b.signin) return a.signin ? -1 : 1;
       return a.ms - b.ms;
     }).forEach(function (r) {
       var inUse = r.url === cur;
@@ -204,7 +205,7 @@
       name.textContent = R.host(r.url);
       var ms = document.createElement("span");
       ms.className = "rms";
-      ms.textContent = r.ok ? r.ms + " ms" : "cannot proxy";
+      ms.textContent = r.ok ? r.ms + " ms" + (r.signin ? " · sign-in ok" : " · sign-in fails") : "cannot proxy";
       var use = document.createElement("button");
       use.className = "ghost tiny";
       use.textContent = inUse ? "In use" : "Use";
@@ -248,7 +249,8 @@
     R.probeAll(3500).then(function (res) {
       results = res;
       var good = res.filter(function (x) { return x.ok; }).length;
-      status.textContent = good + " of " + res.length + " relays carried a test request — click Use on one, or just press Play.";
+      var capable = res.filter(function (x) { return x.signin; }).length;
+      status.textContent = good + " of " + res.length + " relays carried a test request, " + capable + " can complete the Microsoft sign-in handshake" + (capable ? " — click Use on one, or just press Play." : " — signing in will fail through all of them until one recovers.");
       status.className = "status" + (good ? " ok" : "");
       btn.disabled = false;
       renderList();
@@ -282,18 +284,23 @@
     acct.className = "status";
   });
 
+  function hasAccount() {
+    try { var a = JSON.parse(localStorage.getItem("wispcraft_accounts") || "[]") || []; return a.length > 0; } catch (e) { return false; }
+  }
+
   document.getElementById("play").addEventListener("click", function (ev) {
     if (!R || launching) { return; }
     ev.preventDefault();
     launching = true;
     var href = this.getAttribute("href");
+    var needsSignin = !hasAccount();
     function go() { location.href = href; }
-    status.textContent = "Checking your relay can carry traffic…";
+    status.textContent = "Checking your relay can carry traffic and complete the sign-in handshake…";
     status.className = "status";
     R.probe(R.current(), 4000).then(function (res) {
-      if (res.ok) return go();
+      if (res.ok && (res.signin || !needsSignin)) return go();
       return R.probeAll(3500).then(function (all) {
-        var best = all.filter(function (x) { return x.ok; }).sort(function (a, b) { return a.ms - b.ms; })[0];
+        var best = all.filter(function (x) { return x.ok; }).sort(function (a, b) { if (needsSignin && !!a.signin !== !!b.signin) return a.signin ? -1 : 1; return a.ms - b.ms; })[0];
         if (!best) {
           status.textContent = "No relay answered — launching with your saved one.";
           return go();

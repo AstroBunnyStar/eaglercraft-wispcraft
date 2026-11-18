@@ -76,7 +76,76 @@ window.WispRelays = (function () {
   var TEST_REQUEST = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
   var CONTINUE = 0x03, DATA = 0x02, CLOSE = 0x04;
 
-  function probe(url, timeout) {
+  /* Sign-in pre-flight. Microsoft sign-in is a TLS stream the client sends *through the relay*,
+     so a relay whose egress cannot complete that handshake leaves the player looking at
+     `hyper ... tls handshake eof` with no device code at all - a failure the plain-HTTP check
+     below cannot see. This sends a real TLS 1.2 ClientHello for login.microsoftonline.com
+     (269 bytes, captured from a TLS stack, not hand-written: a hand-built one is rejected and
+     every relay then looks broken) and counts any bytes coming back as success. A ServerHello
+     proves the relay carried a TLS record in both directions, which is exactly what sign-in needs.
+     The hello is queued straight after CONNECT instead of after a CONTINUE on the new stream:
+     several relays in LIST never send that CONTINUE, and waiting for it made healthy relays
+     time out. The host is in the hello's SNI, so one fixed byte string works for every relay. */
+  var SIGNIN_HOST = "login.microsoftonline.com";
+  var SIGNIN_PORT = 443;
+  var SIGNIN_HELLO = "FgMBAQgBAAEEAwPPgliUqlculzk1Y/RCyWg74Vjrd+JEKS3hUuGPMQXuFgAAYsAvwCvAMMAsAJ7AJwBnwCgAawCjAJ/MqcyozKrArcCfwF3AYcBXwFMAosCswJ7AXMBgwFbAUsAkAGrAIwBAwArAFAA5ADjACcATADMAMgCdwJ3AUQCcwJzAUAA9ADwANQAvAQAAef8BAAEAAAAAHgAcAAAZbG9naW4ubWljcm9zb2Z0b25saW5lLmNvbQALAAQDAAECAAoADAAKAB0AFwAeABgAGQAjAAAAFgAAABcAAAANACoAKAQDBQMGAwgHCAgICQgKCAsIBAgFCAYEAQUBBgEDAwMBAwIEAgUCBgI=";
+  var SIGNIN_BYTES = null;
+
+  function helloBytes() {
+    if (SIGNIN_BYTES) return SIGNIN_BYTES;
+    var raw = atob(SIGNIN_HELLO);
+    var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    SIGNIN_BYTES = out;
+    return out;
+  }
+
+  /* Resolves ok:true only when the relay returned TLS bytes from Microsoft. */
+  function probeSignIn(url, timeout) {
+    var target = normalize(url);
+    return new Promise(function (resolve) {
+      if (!target) return resolve({ url: String(url), ok: false, ms: 0 });
+      var started = Date.now(), done = false, ws = null, timer = null, sent = false;
+      function finish(ok) {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        try { if (ws && ws.readyState === 1) ws.close(); } catch (e) {}
+        resolve({ url: target, ok: ok, ms: Date.now() - started });
+      }
+      timer = setTimeout(function () { finish(false); }, timeout || 3500);
+      try { ws = new WebSocket(target); } catch (e) { finish(false); return; }
+      ws.binaryType = "arraybuffer";
+      ws.onopen = function () { if (done) { try { ws.close(); } catch (e) {} } };
+      ws.onmessage = function (ev) {
+        var d = new Uint8Array(ev.data);
+        if (d[0] === DATA) {
+          /* any payload is a ServerHello or an alert: either way TLS arrived */
+          if (d.length > 5 && sent) finish(true);
+          return;
+        }
+        if (d[0] === CLOSE) { finish(false); return; }
+        if (d[0] !== CONTINUE || sent) return;
+        sent = true;
+        var host = new Uint8Array(SIGNIN_HOST.length);
+        for (var i = 0; i < SIGNIN_HOST.length; i++) host[i] = SIGNIN_HOST.charCodeAt(i);
+        var connect = new Uint8Array(8 + host.length);
+        connect[0] = 0x01; connect[1] = 1;
+        connect[5] = 0x01;
+        connect[6] = SIGNIN_PORT & 255; connect[7] = (SIGNIN_PORT >> 8) & 255;
+        connect.set(host, 8);
+        var hello = helloBytes();
+        var data = new Uint8Array(5 + hello.length);
+        data[0] = DATA; data[1] = 1; data.set(hello, 5);
+        try { ws.send(connect); ws.send(data); } catch (e) { finish(false); }
+      };
+      ws.onerror = function () { finish(false); };
+      ws.onclose = function () { finish(false); };
+    });
+  }
+
+  /* Transport only: does the relay carry a proxied request at all? */
+  function probeTraffic(url, timeout) {
     var target = normalize(url);
     return new Promise(function (resolve) {
       if (!target) return resolve({ url: String(url), ok: false, ms: 0 });
@@ -134,6 +203,26 @@ window.WispRelays = (function () {
     });
   }
 
+  /* A relay is usable when it carries traffic; it is *preferable* when it can also complete the
+     sign-in handshake, because a relay that passes only the first test strands anyone who is not
+     already signed in. `signin` reports the second test and never downgrades `ok`. */
+  function probe(url, timeout) {
+    var target = normalize(url);
+    return new Promise(function (resolve) {
+      if (!target) return resolve({ url: String(url), ok: false, ms: 0, signin: false });
+      /* Both streams open at once: run in sequence and the sign-in test inherits a budget already
+         spent by the traffic test, which marked healthy relays as unable to sign in. The sign-in
+         test gets the larger budget because a slow relay still answers in ~3 s. */
+      var traffic = probeTraffic(target, timeout);
+      var signin = probeSignIn(target, Math.max(timeout || 3500, 5000));
+      traffic.then(function (t) {
+        signin.then(function (s) {
+          resolve({ url: target, ok: !!t.ok, ms: t.ms, signin: !!t.ok && !!s.ok, signinMs: s.ms });
+        });
+      });
+    });
+  }
+
   /* Resolves with whatever settled, so one relay that never answers cannot stall the
      caller (timeouts are heavily throttled while the tab is in the background). */
   function probeAll(timeout) {
@@ -144,10 +233,12 @@ window.WispRelays = (function () {
       LIST.forEach(function (u, i) {
         probe(u, t).then(function (r) { out[i] = r; if (--left === 0) finish(); });
       });
-      setTimeout(finish, t + 500);
+      /* the chain above can need longer than one probe timeout; resolving early drops relays */
+      setTimeout(finish, Math.max(t + 500, 5500));
     });
   }
 
   return { DEFAULT: DEFAULT, host: host, stored: stored, current: current,
-           set: set, clear: clear, probe: probe, probeAll: probeAll };
+           set: set, clear: clear, probe: probe, probeSignIn: probeSignIn,
+           probeAll: probeAll };
 })();
