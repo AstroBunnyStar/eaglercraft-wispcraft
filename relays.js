@@ -68,8 +68,9 @@ window.WispRelays = (function () {
      enough: a relay can accept the socket and then never open a stream, which is how the old
      "does it open?" test passed on relays that stalled in game. This opens a real TCP stream,
      sends a request and waits for the reply, so a silent relay fails here instead.
-     Packets are [type][streamID u32 LE][payload]; the greeting's length says whether the stream
-     id is present (9 bytes) or the server speaks the older 5-byte layout. */
+     Both protocol versions share one packet layout - [type][streamID u32 LE][payload], all
+     little-endian (wisp-protocol, "Packet format"); v2 only adds an INFO handshake. The greeting
+     is a CONTINUE for stream 0 and must arrive before the client sends anything. */
   var TEST_HOST = "example.com";
   var TEST_PORT = 80;
   var TEST_REQUEST = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
@@ -79,7 +80,7 @@ window.WispRelays = (function () {
     var target = normalize(url);
     return new Promise(function (resolve) {
       if (!target) return resolve({ url: String(url), ok: false, ms: 0 });
-      var started = Date.now(), done = false, ws = null, timer = null, greeting = null, sent = false;
+      var started = Date.now(), done = false, ws = null, timer = null, sent = false;
       function finish(ok) {
         if (done) return;
         done = true;
@@ -97,9 +98,8 @@ window.WispRelays = (function () {
       function send() {
         if (sent || done) return;
         sent = true;
-        var framed = greeting !== "v1";
-        var connectHead = framed ? [0x01, 1, 0, 0, 0] : [0x01];
-        var dataHead = framed ? [0x02, 1, 0, 0, 0] : [0x02];
+        var connectHead = [0x01, 1, 0, 0, 0];                   /* type, then stream ID 1 */
+        var dataHead = [0x02, 1, 0, 0, 0];
         var connect = new Uint8Array(connectHead.length + 3 + TEST_HOST.length);
         connect.set(connectHead, 0);
         connect[connectHead.length] = 0x01;                       /* stream type: TCP */
@@ -116,20 +116,13 @@ window.WispRelays = (function () {
       timer = setTimeout(function () { finish(false); }, timeout || 3500);
       try { ws = new WebSocket(target); } catch (e) { finish(false); return; }
       ws.binaryType = "arraybuffer";
-      /* servers that never greet get a best-effort CONNECT in the common layout */
-      ws.onopen = function () {
-        if (done) { try { ws.close(); } catch (e) {} return; }
-        setTimeout(send, 700);
-      };
+      /* a relay that opens and never greets is broken: the greeting is mandatory */
+      ws.onopen = function () { if (done) { try { ws.close(); } catch (e) {} } };
       ws.onmessage = function (ev) {
         var d = new Uint8Array(ev.data);
-        if (d[0] === CONTINUE) {
-          if (!greeting) greeting = d.length >= 9 ? "v2" : "v1";
-          send();
-          return;
-        }
+        if (d[0] === CONTINUE) { send(); return; }
         if (d[0] === DATA) {
-          var at = greeting === "v1" ? 1 : 5, head = "";
+          var at = 5, head = "";
           for (var i = 0; i < 5 && at + i < d.length; i++) head += String.fromCharCode(d[at + i]);
           finish(head === "HTTP/");
           return;

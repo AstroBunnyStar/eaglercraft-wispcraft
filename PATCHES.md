@@ -102,10 +102,11 @@ on exactly that relay; it now requires a reply from a proxied stream, which is t
 
 ### How the pre-flight works
 
-`WispRelays.probe()` opens the relay with no subprotocol, waits for its greeting and reads that
-greeting's length to pick the packet layout: 9 bytes means `[type][streamID u32 LE][payload]`, 5
-bytes means the older layout with no stream id. A server that never greets gets one CONNECT in the
-common layout after 700 ms. The probe then CONNECTs to `example.com:80`, sends
+`WispRelays.probe()` opens the relay with no subprotocol and waits for the greeting — a CONTINUE
+for stream 0, which the spec requires before the client may send anything. Both protocol versions use
+the same `[type][streamID u32 LE][payload]` layout (little-endian) and differ only in the INFO
+handshake, so there is no version branch: a missing greeting is a failure, not something to guess
+around. The probe then CONNECTs stream 1 to `example.com:80`, sends
 `GET / HTTP/1.1 … Connection: close`, and reports success only when the first DATA packet starts with
 `HTTP/`. A relay that accepts the socket and then stalls fails within the probe timeout instead of
 after launch.
