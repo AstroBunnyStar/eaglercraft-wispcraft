@@ -29,26 +29,206 @@
   }
   /* Synchronous and offline: the display name comes straight from the stored account, and the
      uuid - all the client needs to look a skin up - falls back to the one inside the token. */
-  /* The engine overwrites this key with a generated Guest_xxxx name during boot, which would
-     make a signed-in account join under the wrong name. Once an account is known, pin it. */
+  /* The client also keeps its own profile blob in _eaglercraftX.p, and the profile editor
+     draws the name straight out of it - that blob is where a generated Guest_xxxxx stayed
+     visible even once _eaglercraftX.username was pinned. Its username field is the bytes
+     08 00 08 "username" <u16 length> <text>, so rewrite that value in place and keep the
+     length prefix consistent. Anything that does not parse is left untouched. */
+  /* The client's own profile blob is NBT: a compound of tags, each written as
+     [tag][u16 name][value]. The profile editor draws both its name and its Player Skin from it,
+     so it is written here field for field the way the client writes it (verified against a blob
+     the client itself emitted) - a blob it cannot parse is silently replaced by a fresh guest
+     profile, which is the state this is here to prevent. */
+  function nbtStr(t) { return String.fromCharCode((t.length >> 8) & 255, t.length & 255) + t; }
+  function nbtInt(n) {
+    return String.fromCharCode((n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255);
+  }
+  function nbtField(tag, name, value) { return tag + nbtStr(name) + value; }
+  /* The Player Skin picker lists the client's presets plus the custom skins stored in this blob;
+     it is never fed from the Mojang profile, so a signed-in player otherwise opens the editor on a
+     stock preset. A custom skin is one compound in the skins list - name, data (the texture as
+     16384 bytes, A,R,G,B) and model (0 classic, 1 slim) - with presetSkin = -1 and customSkin = 0
+     selecting it. Without a skin the same blob still carries the real name and the default preset. */
+  function profileBlob(name, skin) {
+    var has = !!(skin && skin.data);
+    var body =
+      nbtField("\u0009", "capes", "\u0000" + nbtInt(0)) +
+      nbtField("\u0003", "presetCape", nbtInt(0)) +
+      nbtField("\u0003", "customCape", nbtInt(-1)) +
+      "\u0009" + nbtStr("skins");
+    if (has) {
+      body +=
+        "\u000a" + nbtInt(1) +
+        nbtField("\u0008", "name", nbtStr(skin.name)) +
+        nbtField("\u0007", "data", nbtInt(skin.data.length) + skin.data) +
+        nbtField("\u0001", "model", String.fromCharCode(skin.model & 255)) +
+        "\u0000";
+    } else {
+      body += "\u0000" + nbtInt(0);
+    }
+    body +=
+      nbtField("\u0008", "username", nbtStr(name)) +
+      nbtField("\u0001", "hideDefaultUsernameWarning26", "\u0001") +
+      nbtField("\u0003", "presetSkin", nbtInt(has ? -1 : 16)) +
+      nbtField("\u0003", "customSkin", nbtInt(has ? 0 : -1)) +
+      "\u0000";
+    return btoa("\u000a\u0000\u0000" + body);
+  }
+  var SKIN_RELOAD = "wispcraft_skin_reloaded";
+  /* A legacy 64x32 skin has only the left arm and leg drawn; the client completes it itself by
+     copying the top half down and mirroring those limbs into the second half. These are exactly
+     the region copies its own SkinConverter.convert64x32to64x64 performs, so an old skin is stored
+     as the same complete 64x64 texture the client would build in memory. */
+  function legacyPixels(src) {
+    var out = new Uint8ClampedArray(64 * 64 * 4);  /* transparent until each region is copied */
+    function copy(dx1, dy1, dx2, dy2, sx1, sy1, sx2, sy2) {
+      var w = sx2 - sx1, h = sy2 - sy1, flip = dx1 > dx2;
+      for (var y = 0; y < h; ++y) {
+        for (var x = 0; x < w; ++x) {
+          var s = ((sy1 + y) * 64 + (sx1 + x)) * 4;
+          var d = ((dy1 + y) * 64 + dx1 + (flip ? w - 1 - x : x)) * 4;
+          out[d] = src[s];
+          out[d + 1] = src[s + 1];
+          out[d + 2] = src[s + 2];
+          out[d + 3] = src[s + 3];
+        }
+      }
+    }
+    copy(0, 0, 64, 32, 0, 0, 64, 32);
+    copy(24, 48, 20, 52, 4, 16, 8, 20);
+    copy(28, 48, 24, 52, 8, 16, 12, 20);
+    copy(20, 52, 16, 64, 8, 20, 12, 32);
+    copy(24, 52, 20, 64, 4, 20, 8, 32);
+    copy(28, 52, 24, 64, 0, 20, 4, 32);
+    copy(32, 52, 28, 64, 12, 20, 16, 32);
+    copy(40, 48, 36, 52, 44, 16, 48, 20);
+    copy(44, 48, 40, 52, 48, 16, 52, 20);
+    copy(36, 52, 32, 64, 48, 20, 52, 32);
+    copy(40, 52, 36, 64, 44, 20, 48, 32);
+    copy(44, 52, 40, 64, 40, 20, 44, 32);
+    copy(48, 52, 44, 64, 52, 20, 56, 32);
+    return out;
+  }
+  /* Fetches the account's texture and hands back the bytes the blob wants. The profile API names
+     an http texture while the published site is https, where that is mixed content, so the scheme
+     follows the page. */
+  function readSkin(sk, name, done) {
+    var url = String(sk.url);
+    if (location.protocol === "https:") url = url.replace(/^http:/, "https:");
+    fetch(url, { mode: "cors" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.blob();
+    }).then(function (blob) {
+      return createImageBitmap(blob);
+    }).then(function (bmp) {
+      /* 64x64 is the modern layout, 64x32 is a legacy skin that is completed just below */
+      if (bmp.width !== 64 || (bmp.height !== 64 && bmp.height !== 32)) {
+        throw new Error("skin is " + bmp.width + "x" + bmp.height);
+      }
+      var canvas = document.createElement("canvas");
+      canvas.width = 64;
+      canvas.height = bmp.height;
+      var ctx = canvas.getContext("2d");
+      ctx.drawImage(bmp, 0, 0);
+      var raw = ctx.getImageData(0, 0, 64, bmp.height).data;
+      var px = bmp.height === 32 ? legacyPixels(raw) : raw;
+      /* the blob stores each pixel as A,R,G,B - alpha first - while canvas hands back R,G,B,A,
+         so the channels are reordered here rather than stored scrambled */
+      var data = "", buf = [];
+      for (var i = 0; i < px.length; i += 4) {
+        buf.push(px[i + 3], px[i], px[i + 1], px[i + 2]);
+        if (buf.length === 4096) {
+          data += String.fromCharCode.apply(null, buf);
+          buf = [];
+        }
+      }
+      if (buf.length) data += String.fromCharCode.apply(null, buf);
+      done({ name: name, model: /slim/i.test(sk.variant || "") ? 1 : 0, data: data });
+    }).catch(function () { done(null); });
+  }
+  /* True when the profile already carries a skin, whether the account's own or one the player
+     picked. The skins list starts at the tag byte, then its name, then an element type: 0 means
+     the list is empty and the profile is fair game for seeding. */
+  function profileHasSkin(b64) {
+    if (!b64) return false;
+    var bytes;
+    try { bytes = atob(String(b64)); } catch (e) { return false; }
+    var at = bytes.indexOf("\u0009\u0000\u0005skins");
+    return at > -1 && bytes.charCodeAt(at + 8) !== 0;
+  }
+  /* Lays the account's skin into the profile before the client reads it, once. A profile that
+     already carries a skin is left alone, so a skin picked in the editor is never overwritten and
+     a boot where seeding is already done neither fetches nor reloads. */
+  function seedAccountSkin() {
+    var acc = lastAccount(), blob;
+    if (!acc || !acc.username) return;
+    try { blob = localStorage.getItem("_eaglercraftX.p"); } catch (e) { return; }
+    if (profileHasSkin(blob)) return;
+    var profile = cachedProfile(acc.username);
+    var sk = profile && (profile.skins || [])[0];
+    if (!sk || !sk.url) return;
+    readSkin(sk, acc.username, function (got) {
+      if (!got) return;
+      try {
+        localStorage.setItem("_eaglercraftX.p", profileBlob(acc.username, got));
+      } catch (e) { return; }
+      /* the client read the profile at boot, before the texture could arrive, so the skin shows
+         from the next start - reload once per session, while the game is still loading */
+      try {
+        if (sessionStorage.getItem(SKIN_RELOAD)) return;
+        sessionStorage.setItem(SKIN_RELOAD, "1");
+        location.reload();
+      } catch (e) {}
+    });
+  }
+
+  function fixProfileBlob(b64, name) {
+    var bytes;
+    try { bytes = atob(String(b64)); } catch (e) { return b64; }
+    var sig = "\u0008\u0000\u0008username", at = bytes.indexOf(sig);
+    if (at < 0) return b64;
+    var lenAt = at + sig.length;
+    var len = (bytes.charCodeAt(lenAt) << 8) | bytes.charCodeAt(lenAt + 1);
+    if (bytes.substr(lenAt + 2, len) === name) return b64;
+    return btoa(
+      bytes.slice(0, lenAt) +
+      String.fromCharCode((name.length >> 8) & 255, name.length & 255) + name +
+      bytes.slice(lenAt + 2 + len)
+    );
+  }
+  /* The engine overwrites _eaglercraftX.username with a generated Guest_xxxx name during boot,
+     which would make a signed-in account join under the wrong name. Once an account is known,
+     pin that key - and the profile blob beside it. */
   function installPin(name) {
-    var want = btoa(name);
     var orig = Storage.prototype.setItem;
-    if (orig.__wispcraftPin) { orig.__wispcraftName = want; return; }
+    if (orig.__wispcraftPin) { orig.__wispcraftName = name; return; }
     var wrapped = function (key, value) {
-      if (key === "_eaglercraftX.username") {
-        var keep = wrapped.__wispcraftName;
-        if (keep) {
+      var keep = wrapped.__wispcraftName;
+      if (keep) {
+        if (key === "_eaglercraftX.username") {
           var text = "";
           try { text = atob(String(value)); } catch (e) { text = String(value); }
-          if (!text || /^Guest_/.test(text)) value = keep;
+          if (!text || /^Guest_/.test(text)) value = btoa(keep);
+        } else if (key === "_eaglercraftX.p") {
+          value = fixProfileBlob(value, keep);
         }
       }
       return orig.call(this, key, value);
     };
     wrapped.__wispcraftPin = true;
-    wrapped.__wispcraftName = want;
+    wrapped.__wispcraftName = name;
     Storage.prototype.setItem = wrapped;
+  }
+  /* Skins and capes only come from the profile API, which cannot answer before the first frame
+     is drawn. Keep the last good profile and seed it from memory at start-up so the client has
+     the account's real skin from that first frame. The profile editor's picker is fed separately,
+     from the skin itself - see seedAccountSkin() below. */
+  var PROFILE_CACHE = "wispcraft_profile_cache";
+  function cachedProfile(name) {
+    try {
+      var p = JSON.parse(localStorage.getItem(PROFILE_CACHE) || "null");
+      return p && p.name === name && (p.skins || []).length ? p : null;
+    } catch (e) { return null; }
   }
   function ensureUsername() {
     var acc = lastAccount();
@@ -78,9 +258,28 @@
       a.yggToken = acc.token;
       a.msToken = acc.ms || "";
     }
+    var name = a.user.name || acc.username;
+    /* the cached profile carries the account's own skin and capes, so the client has them
+       from the first frame instead of waiting on the network */
+    if (!(a.user.skins || []).length) {
+      var cached = cachedProfile(name);
+      if (cached) {
+        a.user = cached;
+        a.yggToken = acc.token;
+        a.msToken = acc.ms || "";
+        name = cached.name || name;
+      }
+    }
     /* the client reads its own display name from here, base64 */
-    installPin(a.user.name || acc.username);
-    try { localStorage.setItem("_eaglercraftX.username", btoa(a.user.name || acc.username)); } catch (e) {}
+    installPin(name);
+    try { localStorage.setItem("_eaglercraftX.username", btoa(name)); } catch (e) {}
+    /* and make sure the client's own profile blob already carries that name: rewrite a guest
+       name if one is stored, or lay one down when the client would have to invent a guest
+       profile at boot */
+    try {
+      var blob = localStorage.getItem("_eaglercraftX.p");
+      localStorage.setItem("_eaglercraftX.p", blob ? fixProfileBlob(blob, name) : profileBlob(name));
+    } catch (e) {}
     return true;
   }
   /* The bundle only refreshes the profile when the account dropdown changes, and deletes the
@@ -101,6 +300,7 @@
       a.user = profile;
       a.yggToken = acc.token;
       a.msToken = acc.ms || "";
+      try { localStorage.setItem(PROFILE_CACHE, JSON.stringify(profile)); } catch (e) {}
       try { localStorage.setItem("_eaglercraftX.username", btoa(profile.name)); } catch (e) {}
     }).catch(function () {
       if (!retried) setTimeout(function () { refreshProfile(true); }, 3000);
@@ -108,6 +308,7 @@
   }
 
   seedAuthstore();
+  seedAccountSkin();
 
   function signedIn() {
     try { return (JSON.parse(localStorage.getItem(KEY) || "[]") || []).length > 0; } catch (e) { return false; }
