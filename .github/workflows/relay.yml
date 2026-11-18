@@ -1,0 +1,29 @@
+name: relay
+
+# The client reaches every server through one relay; nothing else notices when it stops
+# carrying streams. This opens a real one through the default relay each morning.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Default relay carries traffic
+        run: node tools/probe-relay.mjs
+
+      # informational: the launcher ranks these itself, so a few being down is normal
+      - name: Every curated relay
+        if: always()
+        run: node tools/probe-relay.mjs --all
