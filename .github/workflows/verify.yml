@@ -30,8 +30,8 @@ jobs:
       - name: Launcher inline script parses
         run: node tools/check-launcher.mjs
 
-      - name: Skin seeding and blob layout
-        run: node --test test/seed-and-blob.test.mjs
+      - name: Tests
+        run: node --test test/
 
       - name: Bundle default matches relays.js
         run: node tools/patch-wispcraft.mjs --check
