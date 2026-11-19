@@ -1,0 +1,50 @@
+name: apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_url:
+        description: URL of a git patch to apply and commit
+        required: true
+      reason:
+        description: Commit message
+        required: false
+        default: Land the pending working tree
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download patch
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/publish.patch" "${{ inputs.patch_url }}"
+          wc -c "$RUNNER_TEMP/publish.patch"
+
+      - name: Apply
+        run: |
+          set -euo pipefail
+          git apply --verbose --whitespace=nowarn "$RUNNER_TEMP/publish.patch"
+          git status --short
+
+      - name: Verify before committing
+        run: |
+          set -euo pipefail
+          node --check wispcraft.js
+          node tools/check-launcher.mjs
+          node --test
+          node tools/patch-wispcraft.mjs --check
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "${{ inputs.reason }}"
+          git push
