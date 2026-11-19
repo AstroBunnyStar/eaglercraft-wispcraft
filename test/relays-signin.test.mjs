@@ -1,21 +1,21 @@
 /**
- * Guards the sign-in pre-flight in relays.js:
+ * Guards the sign-in pre-flight shipped inside index.html:
  *   - the embedded ClientHello is a well-formed TLS record for the sign-in host;
  *   - a ServerHello record passes, even when a relay splits it across DATA packets;
  *   - a TLS alert, plain text or a handshake that is not a ServerHello fails;
  *   - a silent traffic test is retried once before a relay is called unusable.
  *
- * relays.js is loaded in a vm with a fake window and WebSocket, so these tests drive the real
- * probe rather than a copy of it. Run with: node --test
+ * The page's inline relay module is cut out of index.html and loaded in a vm with a fake window
+ * and WebSocket, so these tests drive the code the browser runs rather than a copy of it.
+ * Run with: node --test
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import path from "node:path";
 import vm from "node:vm";
 
-const ROOT = path.resolve(import.meta.dirname, "..");
-const SOURCE = fs.readFileSync(path.join(ROOT, "relays.js"), "utf8");
+import { relaySource } from "../tools/relay-source.mjs";
+
+const SOURCE = relaySource();
 const HOST = "login.microsoftonline.com";
 
 const CONTINUE = 3, DATA = 2;
@@ -103,9 +103,9 @@ class FakeSocket {
 function load() {
   const sandbox = { window: {}, URL, atob, WebSocket: FakeSocket, setTimeout, clearTimeout };
   vm.createContext(sandbox);
-  vm.runInContext(SOURCE, sandbox, { filename: "relays.js" });
+  vm.runInContext(SOURCE, sandbox, { filename: "index.html" });
   const relays = sandbox.window.WispRelays;
-  assert.ok(relays && relays.probeSignIn && relays.signinHello, "relays.js exposes the probe");
+  assert.ok(relays && relays.probeSignIn && relays.signinHello, "the page exposes the probe");
   return relays;
 }
 
@@ -279,6 +279,17 @@ test("a handshake that failed while traffic was down is retried once traffic pas
   assert.equal(trafficAttempts, 2, "traffic was retried");
   assert.equal(attempts, 2, "the stale handshake failure was not believed");
   assert.equal(result.signin, true);
+});
+
+test("probeBest hands back a relay that can carry the session", async () => {
+  const hello = [packet(DATA, 1, serverHello())];
+  scenario = { signin: Array.from({ length: 30 }, () => hello), traffic: Array(30).fill(true) };
+  signinAttempts = 0;
+  trafficAttempts = 0;
+  const relays = load();
+  const best = await relays.probeBest(500, 100, true);
+
+  assert.ok(best && best.ok && best.signin, "the relay returned can proxy and sign in");
 });
 
 test("plain text and a handshake that is not a ServerHello both fail", async () => {

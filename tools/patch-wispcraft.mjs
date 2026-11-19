@@ -8,8 +8,8 @@
  *      account has no Java profile (404) or the token/relay was rejected (401/403).
  *      This injects a helper that reports the HTTP status plus a cause hint.
  *   2. Built-in relay default - pins the bundle's fallback relay to the same value
- *      relays.js exports as DEFAULT, which is read from that file so a replaced bundle cannot
- *      drift from the launcher (and --check needs no extra flag).
+ *      the launcher page ships as DEFAULT, which is read out of index.html so a replaced bundle
+ *      cannot drift from the launcher (and --check needs no extra flag).
  *
  * Usage:
  *   node tools/patch-wispcraft.mjs                 # patch ./wispcraft.js
@@ -40,10 +40,10 @@ const opt = (name, fallback) => {
 };
 
 const file = path.resolve(opt("--file", "wispcraft.js"));
-/* relays.js is the single source of truth for the default relay; the bundle's pinned fallback
+/* index.html is the single source of truth for the default relay; the bundle's pinned fallback
    follows it unless a caller is patching a copy against some other launcher. */
 function launcherRelayDefault() {
-  const candidates = [path.join(path.dirname(file), "relays.js"), path.resolve("relays.js")];
+  const candidates = [path.join(path.dirname(file), "index.html"), path.resolve("index.html")];
   for (const candidate of candidates) {
     try {
       const found = fs.readFileSync(candidate, "utf8").match(/\bvar\s+DEFAULT\s*=\s*"([^"]+)"/);

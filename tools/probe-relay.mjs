@@ -1,10 +1,10 @@
 /**
  * Checks the relay the launcher actually uses, with the launcher's own idea of "usable".
  *
- * relays.js already defines that precisely: open the WebSocket, wait for the Wisp greeting,
+ * index.html already defines that precisely: open the WebSocket, wait for the Wisp greeting,
  * open a TCP stream to example.com:80 and wait for HTTP to come back - a relay that accepts the
- * handshake but never carries a stream fails. This loads that script unchanged (it is a browser
- * script, so it gets a window) and reports what it finds.
+ * handshake but never carries a stream fails. This loads that page's relay module unchanged (it is
+ * a browser script, so it gets a window) and reports what it finds.
  *
  *   node tools/probe-relay.mjs                 # the DEFAULT relay; exit 1 when it is down
  *   node tools/probe-relay.mjs wss://host/     # any relay
@@ -12,23 +12,21 @@
  *
  * Needs a global WebSocket, which Node 22+ has. Exit 0 = the relay carried traffic.
  */
-import fs from "node:fs";
-import path from "node:path";
 import vm from "node:vm";
-import { fileURLToPath } from "node:url";
 
-const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+import { relaySource } from "./relay-source.mjs";
 
 if (typeof WebSocket !== "function") {
   console.error(`needs a global WebSocket; Node ${process.version} has none (22+ does)`);
   process.exit(2);
 }
 
-/** relays.js assigns window.WispRelays; nothing it defines runs until it is called. */
+/** the page assigns window.WispRelays; nothing it defines runs until it is called. */
 function launcher() {
-  const context = { window: {}, URL, Uint8Array, Promise, setTimeout, clearTimeout, WebSocket };
+  /* atob decodes the captured ClientHello; a vm context does not inherit Node's globals */
+  const context = { window: {}, URL, atob, Uint8Array, Promise, setTimeout, clearTimeout, WebSocket };
   vm.createContext(context);
-  vm.runInContext(fs.readFileSync(path.join(ROOT, "relays.js"), "utf8"), context, { filename: "relays.js" });
+  vm.runInContext(relaySource(), context, { filename: "index.html" });
   return context.window.WispRelays;
 }
 

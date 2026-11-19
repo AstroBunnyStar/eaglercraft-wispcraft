@@ -15,7 +15,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_ORIGIN = "https://astrobunnystar.github.io/eaglercraft-wispcraft/";
-const FILES = ["index.html", "play.html", "relays.js", "wispcraft.js"];
+const FILES = ["index.html", "play.html", "wispcraft.js"];
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");

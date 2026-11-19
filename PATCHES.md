@@ -63,7 +63,7 @@ the original throw text `mc did not return a profile`, and the binding pattern
 ## Patch 2 — pinned relay default
 
 The bundle reads `localStorage.wispcraft_wispurl || <CONST>`. The patch pins `<CONST>` to the
-value `relays.js` exports as `DEFAULT`, which the tool now reads from that file — so a replaced
+value `index.html` ships as `DEFAULT`, which the tool now reads out of that page — so a replaced
 bundle cannot quietly fall back to a different relay than the launcher shows, and `--check` works
 without passing the value again. `--default-relay` still overrides it when patching a copy that
 belongs to some other launcher. The constant's identifier is discovered from the expression, because
@@ -71,13 +71,13 @@ minifiers rename it between builds.
 
 ## Relay default
 
-`relays.js` ships a fixed `DEFAULT` (`wss://linuxontab-net.fly.dev/wisp/`) instead of probing on
+`index.html` ships a fixed `DEFAULT` (`wss://linuxontab-net.fly.dev/wisp/`) instead of probing on
 every launch, because the probe is the wrong tool for choosing the first relay:
 
 - a fixed default starts the game immediately on a first visit, with no 22-relay sweep first;
-- Play already tests the saved relay with a real proxied request and, only when that fails, sweeps
-  the list and switches to the fastest relay that carries traffic — so a bad default costs one
-  failed test, not a stuck page;
+- the page already tests the saved relay with a real proxied request and, only when that fails,
+  asks the list for a relay that carries traffic — so a bad default costs one failed test, not a
+  stuck page;
 - a sweep measures one round-trip to a fixed host, not throughput or stability for the server the
   player will actually join, so "always take the fastest" would still re-rank on noise and throw
   away a relay the player chose on purpose.
@@ -130,8 +130,30 @@ around. The probe then CONNECTs stream 1 to `example.com:80`, sends
 `HTTP/`. A relay that accepts the socket and then stalls fails within the probe timeout instead of
 after launch.
 
-**Play** tests the saved relay once; if that fails it sweeps the whole list in parallel and switches
-to the fastest relay that carried the test request. **Check relays** runs the same sweep on demand.
+**The page** tests the saved relay once, then hands the tab to `play.html`; only when that test
+fails does it ask the list for one relay that can carry the session and save it. There is no launcher
+screen and no relay list in front of the game: `index.html` is one self-contained file (relay module
+inlined between the `<relay-probe>` markers) that shows a black boot screen while it probes and then
+`location.replace()`s into the game, so the pre-flight costs a few hundred milliseconds on a healthy
+relay. Choosing a different relay by hand is **Wisp Settings → Wisp Server** in game, and the list
+below is the fallback when the saved one stops working.
+
+That fallback does not wait for all 22 relays. `probeBest()` returns as soon as a relay that can
+carry the session has answered and a 500 ms grace for a faster neighbour has passed, so a dead saved
+relay costs ~1.4 s measured instead of the ~6.7 s the full sweep took. A pass is remembered for 10
+minutes (`localStorage.wispcraft_relay_check`, keyed to the relay in use), so a relaunch goes
+straight through; a fresh browser, a relay the player just changed, or a verdict older than 10
+minutes gets the full test, and a failed test clears the verdict instead of leaving a stale pass
+behind. `test/launch.test.mjs` runs the page's controller in a vm and pins that down, and
+`test/relays-signin.test.mjs` covers `probeBest()` itself.
+
+**The game page is not fetched while the relay is tested.** That was tried and measured, and it
+cannot work on this host: Chrome does not keep a 43.5 MB document - two `fetch()`es of `play.html`
+both crossed the wire in full, and a `<link rel=prefetch>` was not adopted by the following
+navigation - while `sounds.epk` (25.9 MB) and `wispcraft.js` came from the disk cache on their
+second request. A parallel fetch of `play.html` is therefore discarded when the tab navigates, which
+doubles the first load (86.99 MB instead of 43.49 MB) and does not move the moment the game starts
+downloading. Cutting the wait itself is what works: the early-resolving search above.
 The traffic target is deliberately a plain HTTP host: Wisp is protocol-agnostic, so a reply proves the
 whole path (socket → stream → relay egress → data back) without TLS or a Minecraft handshake.
 
@@ -153,13 +175,13 @@ and a wrong demotion hides a working relay from every signed-out player. The ret
 the relay carried the traffic test, so a relay that cannot proxy at all is still tested once, and
 `probeAll()`'s fallback deadline is long enough to wait for it instead of dropping the relay. `probe()` reports `ok`
 (carried the test request) and `signin` (completed the sign-in handshake) separately: a relay that
-fails `signin` can still play, but it strands anyone who is not signed in yet. **Play** therefore
-prefers `signin` relays while the browser has no saved account, and the relay list labels the ones
-that cannot sign in. `us-east.wisp.q13x.com` is the case this exists for: its sign-in stream closed
-while its plain-HTTP test still answered on some sweeps.
+fails `signin` can still play, but it strands anyone who is not signed in yet. The page therefore
+prefers `signin` relays while the browser has no saved account, and the sweep labels them; the relay
+picked is what the game boots with. `us-east.wisp.q13x.com` is the case this exists for: its sign-in
+stream closed while its plain-HTTP test still answered on some sweeps.
 
 That handshake retry has not been observed rescuing anything yet, and the sweeps say why: across
-three consecutive **Check relays** runs and 88 direct probes, every relay that carried traffic also
+three consecutive relay sweeps and 88 direct probes, every relay that carried traffic also
 completed the sign-in handshake on its first attempt, so the second handshake never ran at all. A
 *sign-in fails* label is therefore rare in practice; when it appeared earlier it came from a moment
 when the relay was failing everything, not from a repeatable handshake failure.
@@ -177,19 +199,20 @@ retries. `test/relays-signin.test.mjs` covers the retry: a silent first attempt 
 retry carries traffic, two silent attempts still grow the label *cannot proxy*, and a first-attempt
 success is never retried.
 
-To refresh: probe from a browser (the launcher's **Check relays** now runs both tests), update
-`DEFAULT` in `relays.js`, then run `node tools/patch-wispcraft.mjs` so the bundle follows.
+To refresh: probe from a browser (the page runs both tests on every launch), update `DEFAULT` in
+`index.html`, then run `node tools/patch-wispcraft.mjs` so the bundle follows.
 
-Note this is only the last-resort fallback: in normal use the launcher's **Play** pre-flight writes
-the chosen relay into `localStorage`, and the in-game override is **Wisp Settings → Wisp Server**.
-The launcher default and the bundle fallback both come from `DEFAULT` in `relays.js`, which is the one
+Note this is only the last-resort fallback: in normal use the page's pre-flight writes the chosen
+relay into `localStorage`, and the in-game override is **Wisp Settings → Wisp Server**.
+The launcher default and the bundle fallback both come from `DEFAULT` in `index.html`, which is the one
 place to change.
 
 ## What is *not* in the bundle
 
 These survive a `wispcraft.js` swap and need no re-patching:
 
-- relay list, probing and pre-flight (`relays.js` + `index.html`);
+- relay list, probing and pre-flight (`index.html`, one self-contained file — the module sits
+  between the `<relay-probe>` markers so `tools/relay-source.mjs` can hand it to the tests);
 - auto sign-in overlay: raises the Wispcraft panel above the loader, opens Settings, clicks
   *Add an account*, and reloads once when an account appears (`play.html`, head script);
 - signed-in identity pinning (`play.html`, head script) - see below;
@@ -197,6 +220,26 @@ These survive a `wispcraft.js` swap and need no re-patching:
 
 A swapped bundle still has to be wired the same way in `play.html`: `./wispcraft.js` as a head
 script **before** the inline payload scripts, with the auto sign-in script after it.
+
+## Expired tokens (`play.html` head script)
+
+The Minecraft access token this bundle obtains lives **24 hours**, and the bundle stores no refresh
+token and never renews one. Nothing in the client notices, so a browser stays "signed in" for days
+while every online-mode server rejects it - Hypixel answers *"you need a Microsoft authenticated
+account"*, which reads like the Microsoft account is missing even though the name and skin are the
+player's own.
+
+`tokenFresh()` decodes the stored token's `exp` and the head script treats an expired one (or one
+expiring within a minute) as **not signed in**: `signedIn()` now requires a usable token, so the boot
+branch falls through to the sign-in panel, which opens itself and requests a device code exactly as
+it does for a browser with no account. A token without an `exp` claim is trusted. `lastAccount()`
+also prefers a valid entry for the same username, because signing in again adds a second entry for
+the name and the expired one can still be last-used.
+
+`index.html`'s relay pre-flight uses the same rule: an expired token does not count as an account,
+so a signed-out-but-stale browser is given a relay that can complete the Microsoft handshake.
+Verified on a local build: expired token → panel opens with a code, fresh token → no panel, no
+account → panel opens; the client still boots to its menu behind the panel in every case.
 
 ## Signed-in identity pinning (`play.html` head script)
 

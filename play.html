@@ -20,12 +20,36 @@
       return JSON.parse(atob(part + "===".slice((part.length + 3) % 4)));
     } catch (e) { return null; }
   }
+  /* The Minecraft token this bundle stores lasts 24 hours and nothing renews it: no access token
+     is ever refreshed, so a browser can look signed in for days and still be unable to join any
+     online-mode server - Hypixel answers "you need a Microsoft authenticated account" and nothing
+     on screen explains why. An expired token is therefore treated as not signed in, which opens
+     the sign-in panel and offers a code instead of letting a server reject the player. A token
+     that expires within the next minute counts as expired: it cannot finish a join either. */
+  function tokenFresh(acc) {
+    if (!acc || !acc.token) return false;
+    var p = tokenPayload(acc.token);
+    if (!p || !p.exp) return true;                 /* no exp claim: nothing to judge by */
+    return p.exp * 1000 > Date.now() + 60000;
+  }
+  function storedAccounts() {
+    try { return JSON.parse(localStorage.getItem(KEY) || "[]") || []; } catch (e) { return []; }
+  }
+  function accountUsable() {
+    return storedAccounts().some(function (x) { return tokenFresh(x); });
+  }
   function lastAccount() {
-    var accounts = [];
-    try { accounts = JSON.parse(localStorage.getItem(KEY) || "[]") || []; } catch (e) { return null; }
+    var accounts = storedAccounts();
     var wanted = null;
     try { wanted = localStorage.getItem("wispcraft_last_used_account"); } catch (e) {}
-    return accounts.filter(function (x) { return x && x.username === wanted; })[0] || accounts[0] || null;
+    var chosen = accounts.filter(function (x) { return x && x.username === wanted; })[0] || accounts[0] || null;
+    /* adding an account again for the same name leaves both entries behind, so never keep using
+       the expired one just because it is last-used or first in the list */
+    if (chosen && !tokenFresh(chosen)) {
+      var better = accounts.filter(function (x) { return x && x.username === chosen.username && tokenFresh(x); })[0];
+      if (better) chosen = better;
+    }
+    return chosen || null;
   }
   /* Synchronous and offline: the display name comes straight from the stored account, and the
      uuid - all the client needs to look a skin up - falls back to the one inside the token. */
@@ -310,9 +334,10 @@
   seedAuthstore();
   seedAccountSkin();
 
-  function signedIn() {
-    try { return (JSON.parse(localStorage.getItem(KEY) || "[]") || []).length > 0; } catch (e) { return false; }
-  }
+  /* "signed in" now means usable: an account exists whose token can still authenticate a join, so
+     the boot branch and the sign-in watcher both fall back to the panel instead of booting a
+     player who will be kicked by the first online-mode server they try. */
+  function signedIn() { return accountUsable(); }
   function reloadOnce() {
     try { if (sessionStorage.getItem(SEEN)) return; sessionStorage.setItem(SEEN, "1"); } catch (e) {}
     location.reload();
