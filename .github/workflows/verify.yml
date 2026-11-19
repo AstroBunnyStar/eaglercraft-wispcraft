@@ -28,10 +28,10 @@ jobs:
       - name: Scripts parse
         run: |
           set -euo pipefail
-          node --check relays.js
           node --check wispcraft.js
           node --check tools/patch-wispcraft.mjs
           node --check tools/check-launcher.mjs
+          node --check tools/relay-source.mjs
           node --check tools/make-legacy-fixtures.mjs
           node --check tools/verify-published.mjs
           node --check tools/probe-relay.mjs
@@ -42,5 +42,5 @@ jobs:
       - name: Tests
         run: node --test
 
-      - name: Bundle default matches relays.js
+      - name: Bundle default matches index.html
         run: node tools/patch-wispcraft.mjs --check
