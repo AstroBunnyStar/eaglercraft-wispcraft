@@ -2,7 +2,8 @@
  * Guards the sign-in pre-flight in relays.js:
  *   - the embedded ClientHello is a well-formed TLS record for the sign-in host;
  *   - a ServerHello record passes, even when a relay splits it across DATA packets;
- *   - a TLS alert, plain text or a handshake that is not a ServerHello fails.
+ *   - a TLS alert, plain text or a handshake that is not a ServerHello fails;
+ *   - a silent traffic test is retried once before a relay is called unusable.
  *
  * relays.js is loaded in a vm with a fake window and WebSocket, so these tests drive the real
  * probe rather than a copy of it. Run with: node --test
@@ -62,8 +63,9 @@ const HTTP_REPLY = packet(DATA, 1, Buffer.from("HTTP/1.1 200 OK\r\nContent-Lengt
  * Replies with the stream-0 greeting, then answers the first CONNECT: on port 443 with the next
  * sign-in scenario (each attempt takes the next entry), on port 80 with a plain HTTP reply.
  */
-let scenario = { signin: [], traffic: true };
+let scenario = { signin: [], traffic: [true] };
 let signinAttempts = 0;
+let trafficAttempts = 0;
 
 class FakeSocket {
   constructor(url) {
@@ -86,7 +88,7 @@ class FakeSocket {
       this.stream = this.sent[0].readUInt16LE(6) === 443 ? "signin" : "traffic";
       this.replies = this.stream === "signin"
         ? scenario.signin[signinAttempts++] || []
-        : (scenario.traffic ? [HTTP_REPLY] : []);
+        : (scenario.traffic[trafficAttempts++] ? [HTTP_REPLY] : []);
     }
     if (this.sent.length === 2) this.deliver(this.replies);
   }
@@ -115,13 +117,18 @@ async function probe(replies, timeout = 500) {
   return { result, socket: FakeSocket.last, relays };
 }
 
-/** Runs the full probe (traffic + sign-in) with one reply list per sign-in attempt. */
+/**
+ * Runs the full probe (traffic + sign-in). `traffic` is one boolean per traffic attempt (true = the
+ * relay answers with HTTP), so a test can make the first attempt silent and the retry answer.
+ */
 async function fullRelay(signinTries, { traffic = true, timeout = 500 } = {}) {
-  scenario = { signin: signinTries, traffic };
+  const tries = typeof traffic === "boolean" ? [traffic, traffic, traffic] : traffic;
+  scenario = { signin: signinTries, traffic: tries };
   signinAttempts = 0;
+  trafficAttempts = 0;
   const relays = load();
   const result = await relays.probe("wss://relay.example/wisp/", timeout);
-  return { result, attempts: signinAttempts, relays };
+  return { result, attempts: signinAttempts, trafficAttempts, relays };
 }
 
 /* --------------------------------------------------------- ClientHello parsing ---- */
@@ -237,6 +244,41 @@ test("a relay that cannot proxy is not retried for sign-in", async () => {
   assert.equal(attempts, 1, "traffic already failed, so sign-in cannot count");
   assert.equal(result.ok, false);
   assert.equal(result.signin, false);
+});
+
+test("a silent traffic test is retried once and the retry decides", async () => {
+  const { result, trafficAttempts } = await fullRelay([[packet(DATA, 1, serverHello())]], { traffic: [false, true] });
+
+  assert.equal(trafficAttempts, 2, "the silent answer was retried");
+  assert.equal(result.ok, true, "the second request carried traffic");
+  assert.equal(result.signin, true);
+});
+
+test("a relay that fails traffic twice is labelled cannot proxy", async () => {
+  const { result, trafficAttempts } = await fullRelay([[packet(DATA, 1, tlsAlert())]], { traffic: [false, false] });
+
+  assert.equal(trafficAttempts, 2, "exactly one traffic retry, no loop");
+  assert.equal(result.ok, false);
+  assert.equal(result.signin, false);
+});
+
+test("a relay that carries traffic first time does not retry it", async () => {
+  const { result, trafficAttempts } = await fullRelay([[packet(DATA, 1, serverHello())]], { traffic: [true] });
+
+  assert.equal(trafficAttempts, 1, "no second request");
+  assert.equal(result.ok, true);
+  assert.equal(result.signin, true);
+});
+
+test("a handshake that failed while traffic was down is retried once traffic passes", async () => {
+  const { result, attempts, trafficAttempts } = await fullRelay(
+    [[packet(DATA, 1, tlsAlert())], [packet(DATA, 1, serverHello())]],
+    { traffic: [false, true] },
+  );
+
+  assert.equal(trafficAttempts, 2, "traffic was retried");
+  assert.equal(attempts, 2, "the stale handshake failure was not believed");
+  assert.equal(result.signin, true);
 });
 
 test("plain text and a handshake that is not a ServerHello both fail", async () => {

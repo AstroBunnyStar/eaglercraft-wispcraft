@@ -158,6 +158,25 @@ prefers `signin` relays while the browser has no saved account, and the relay li
 that cannot sign in. `us-east.wisp.q13x.com` is the case this exists for: its sign-in stream closed
 while its plain-HTTP test still answered on some sweeps.
 
+That handshake retry has not been observed rescuing anything yet, and the sweeps say why: across
+three consecutive **Check relays** runs and 88 direct probes, every relay that carried traffic also
+completed the sign-in handshake on its first attempt, so the second handshake never ran at all. A
+*sign-in fails* label is therefore rare in practice; when it appeared earlier it came from a moment
+when the relay was failing everything, not from a repeatable handshake failure.
+
+A failed traffic test is retried once too (3 s), for the same reason in the other direction. Those
+three sweeps returned 15, 13 and 16 of 22 relays carrying traffic, and the failing set changed every
+time: `zodiac.icu`, `api.hfhj.links.gointospace.app`, `orbitweb.org`, `motor-cycle-part.org`,
+`dkwmkvruzebnqlmvwzhy.supabase.co`, `civil.quartinal.me`, `studyworkandmore.uk`,
+`xh4r26…ddnsfree.com` and `invisiproxy.com` each failed one sweep and passed another. Repeating the
+probe four times per relay in one process showed the difference between noise and death: only
+`us-east.wisp.q13x.com`, `speedster.heavengtwashere.workers.dev` and `wisp.anjomous.workers.dev`
+opened two traffic CONNECTs every time and still failed, while every other relay answered on the
+first. One timeout is therefore noise, and `probeAll()`'s fallback deadline (11 s) clears both
+retries. `test/relays-signin.test.mjs` covers the retry: a silent first attempt that answers on the
+retry carries traffic, two silent attempts still grow the label *cannot proxy*, and a first-attempt
+success is never retried.
+
 To refresh: probe from a browser (the launcher's **Check relays** now runs both tests), update
 `DEFAULT` in `relays.js`, then run `node tools/patch-wispcraft.mjs` so the bundle follows.
 

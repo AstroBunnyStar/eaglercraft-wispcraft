@@ -233,11 +233,15 @@ window.WispRelays = (function () {
   /* A relay is usable when it carries traffic; it is *preferable* when it can also complete the
      sign-in handshake, because a relay that passes only the first test strands anyone who is not
      already signed in. `signin` reports the second test and never downgrades `ok`.
-     A failed handshake is retried once: a reset mid-handshake or a relay hiccup says nothing about
-     whether sign-in works, and demoting a working relay hides it from every signed-out player. The
-     retry runs only when the relay carried traffic, so a relay that cannot proxy at all is tested
-     once. Worst case is budget + SIGNIN_RETRY_MS, which probeAll's deadline allows for. */
-  var SIGNIN_RETRY_MS = 3000;
+     Both tests are retried once. A failed handshake is retried because a reset mid-handshake says
+     nothing about whether sign-in works, and demoting a working relay hides it from every
+     signed-out player. A failed traffic test is retried for the same reason: in repeated sweeps of
+     the same list the same relays dropped into "cannot proxy" and back again, so one timeout is not
+     evidence that the relay is down. The handshake retry runs only once traffic has been carried,
+     so a relay that cannot proxy at all costs one traffic retry plus one handshake, never a chain.
+     Worst case is timeout + TRAFFIC_RETRY_MS, then SIGNIN_RETRY_MS, which probeAll's deadline
+     allows for. */
+  var SIGNIN_RETRY_MS = 3000, TRAFFIC_RETRY_MS = 3000;
 
   function probe(url, timeout) {
     var target = normalize(url);
@@ -250,11 +254,19 @@ window.WispRelays = (function () {
       var traffic = probeTraffic(target, timeout);
       var signin = probeSignIn(target, budget);
       traffic.then(function (t) {
-        signin.then(function (s) {
-          var result = { url: target, ok: !!t.ok, ms: t.ms, signin: !!t.ok && !!s.ok, signinMs: s.ms };
-          if (result.signin || !t.ok) return resolve(result);
-          probeSignIn(target, SIGNIN_RETRY_MS).then(function (retry) {
-            resolve({ url: target, ok: true, ms: t.ms, signin: !!retry.ok, signinMs: retry.ms });
+        /* A silent answer is retried once before the relay is called unusable: in repeated sweeps
+           the same relays dropped in and out of "cannot proxy" while their neighbours stayed
+           steady, so a single timeout says nothing about the relay. */
+        var again = t.ok ? Promise.resolve(null) : probeTraffic(target, TRAFFIC_RETRY_MS);
+        again.then(function (retry) {
+          var carried = !!t.ok || !!(retry && retry.ok);
+          var ms = t.ok ? t.ms : (retry && retry.ok ? retry.ms : t.ms);
+          signin.then(function (s) {
+            if (!carried) return resolve({ url: target, ok: false, ms: t.ms, signin: false, signinMs: s.ms });
+            if (s.ok) return resolve({ url: target, ok: true, ms: ms, signin: true, signinMs: s.ms });
+            probeSignIn(target, SIGNIN_RETRY_MS).then(function (handshake) {
+              resolve({ url: target, ok: true, ms: ms, signin: !!handshake.ok, signinMs: handshake.ms });
+            });
           });
         });
       });
@@ -271,9 +283,10 @@ window.WispRelays = (function () {
       LIST.forEach(function (u, i) {
         probe(u, t).then(function (r) { out[i] = r; if (--left === 0) finish(); });
       });
-      /* the chain above can need longer than one probe timeout - a failed handshake is retried -
-         and resolving early drops relays from the list, so the fallback must clear the retry too */
-      setTimeout(finish, Math.max(t + 500, 9000));
+      /* the chain above can need longer than one probe timeout - a failed traffic test is retried
+         and a failed handshake is retried after that - and resolving early drops relays from the
+         list, so the fallback must clear both retries */
+      setTimeout(finish, Math.max(t + 500, 11000));
     });
   }
 
