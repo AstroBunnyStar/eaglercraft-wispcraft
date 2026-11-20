@@ -615,7 +615,8 @@
               edits.sort(function (a, b) { return b.at - a.at; });
               for (var k = 0; k < edits.length; k++) next = spliceStringSpan(next, edits[k].at, edits[k].len, edits[k].text);
               var buffer = next.buffer.slice(next.byteOffset, next.byteOffset + next.length);
-              var put = store.put({ path: record.value.path, data: buffer }, record.key);
+              /* the store uses an in-line key (keyPath is the record's own path), so no explicit key */
+              var put = store.put({ path: record.value.path, data: buffer });
               put.onsuccess = function () {
                 window.wispcraftNote("server list repaired: " + touched.join(", "));
                 db.close();
