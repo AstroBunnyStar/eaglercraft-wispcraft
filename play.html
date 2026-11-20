@@ -516,65 +516,119 @@
 
   /* remove only the quick-play parameter: anything else in the query (a pinned relay, a language)
      belongs to the player and must survive */
-  /* Whatever an entry holds, the relay dials it verbatim: an entry saved as "minemen.club" asks the
-     relay for minemen.club:25565, which nothing answers, because the server only listens on its SRV
-     target. The wisp CONNECT packet is page-visible - the bundle's WebSocket proxy creates the relay
-     socket - so the target is rewritten here instead: only when the packet really is a CONNECT for
-     port 25565, host taken from the packet itself, record applied from the cache or resolved once.
-     Anything that does not parse as such a packet is passed through byte for byte. */
-  window.wispcraftRewriteWispTarget = function (socket) {
-    var send = socket.send.bind(socket);
-    var encoder = new TextEncoder(), decoder = new TextDecoder();
-    function parse(view) {
-      if (!view || view.length < 10 || view[0] !== 1 || view[5] !== 1) return null;
-      var len = view[6], end = 7 + len;
-      if (len === 0 || end + 2 > view.length) return null;
-      var host = decoder.decode(view.subarray(7, end)).toLowerCase();
-      if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(host)) return null;
-      var port = view[end] | (view[end + 1] << 8);
-      if (port !== 25565) return null;
-      return { host: host, end: end, view: view };
+  /* The client keeps its server list in servers.dat inside its own filesystem database, and it hands
+     an entry's address to the relay verbatim - so a saved "minemen.club" keeps timing out while the
+     server only listens on geo.minemen.club:25565, and the client's own list wins over the entry the
+     launcher supplies. servers.dat is NBT: a 2-byte length in front of every string. The file is
+     rewritten here, before the client boots, splicing each host that has an SRV record to its
+     target. Only the string and its length change, so the rest of the file stays byte for byte. */
+  function nbtStringSpans(bytes) {
+    var spans = [], pos = 0;
+    function need(n) { if (pos + n > bytes.length) throw new Error("truncated nbt"); }
+    function u16() { need(2); var v = (bytes[pos] << 8) | bytes[pos + 1]; pos += 2; return v; }
+    function i32() { need(4); var v = ((bytes[pos] << 24) | (bytes[pos + 1] << 16) | (bytes[pos + 2] << 8) | bytes[pos + 3]); pos += 4; return v; }
+    function payload(type, depth) {
+      if (depth > 64) throw new Error("nbt too deep");
+      if (type === 1) { need(1); pos += 1; }
+      else if (type === 2) { need(2); pos += 2; }
+      else if (type === 3 || type === 5) { need(4); pos += 4; }
+      else if (type === 4 || type === 6) { need(8); pos += 8; }
+      else if (type === 7) { var n = i32(); need(n); pos += n; }
+      else if (type === 8) { var len = u16(); need(len); spans.push({ at: pos, len: len }); pos += len; }
+      else if (type === 9) {
+        need(1);
+        var inner = bytes[pos++], count = i32();
+        for (var k = 0; k < count; k++) payload(inner, depth + 1);
+      } else if (type === 10) {
+        for (;;) { need(1); var t = bytes[pos++]; if (t === 0) break; payload(8, depth + 1); payload(t, depth + 1); }
+      } else if (type === 11) { var i = i32(); need(i * 4); pos += i * 4; }
+      else if (type === 12) { var l = i32(); need(l * 8); pos += l * 8; }
+      else throw new Error("unknown tag " + type);
     }
-    function build(parsed, target) {
-      var parts = String(target).split(":");
-      var host = parts[0], port = parseInt(parts[1] || "25565", 10) || 25565;
-      var bytes = encoder.encode(host);
-      var out = new Uint8Array(parsed.view.length - (parsed.end - 7) + bytes.length);
-      out.set(parsed.view.subarray(0, 6), 0);
-      out[6] = bytes.length;
-      out.set(bytes, 7);
-      out.set(parsed.view.subarray(parsed.end), 7 + bytes.length);
-      out[7 + bytes.length] = port & 0xff;
-      out[8 + bytes.length] = (port >> 8) & 0xff;
-      return out;
-    }
-    function deliver(original, buffer) {
-      return send(buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length));
-    }
-    socket.send = function (data) {
-      var view = null;
-      try {
-        if (data instanceof ArrayBuffer) view = new Uint8Array(data);
-        else if (data && data.buffer instanceof ArrayBuffer) view = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-      } catch (e) { view = null; }
-      var parsed = view && parse(view);
-      if (!parsed) return send(data);
-      var cached = srvCached(parsed.host);
-      if (cached !== undefined) {
-        if (!cached) return send(data);
-        window.wispcraftNote("relay target " + parsed.host + " -> " + cached);
-        return deliver(data, build(parsed, cached));
-      }
-      /* first sight of this host: hold the CONNECT for the one lookup, then send exactly one frame */
-      resolveSrv(parsed.host).then(function (target) {
-        if (!target) return send(data);
-        window.wispcraftNote("relay target " + parsed.host + " -> " + target);
-        deliver(data, build(parsed, target));
-      }).catch(function () { send(data); });
-      return undefined;
-    };
-    return socket;
-  };
+    need(1);
+    if (bytes[pos] !== 10) throw new Error("not nbt");
+    pos++;
+    payload(8, 0);   /* root name */
+    payload(10, 0);  /* root compound */
+    return spans;
+  }
+  function spliceStringSpan(bytes, at, len, text) {
+    var out = new Uint8Array(bytes.length - len + text.length);
+    out.set(bytes.subarray(0, at), 0);
+    out.set(text, at);
+    out.set(bytes.subarray(at + len), at + text.length);
+    out[at - 2] = (text.length >> 8) & 0xff;
+    out[at - 1] = text.length & 0xff;
+    return out;
+  }
+  function repairSavedServers() {
+    if (!window.indexedDB) return Promise.resolve(0);
+    var DB = "_net_lax1dude_eaglercraft_v1_8_internal_PlatformFilesystem_1_8_8_worlds";
+    return new Promise(function (resolve) {
+      var open = indexedDB.open(DB);
+      open.onerror = function () { resolve(0); };
+      open.onsuccess = function () {
+        var db = open.result;
+        try {
+          var tx = db.transaction("filesystem", "readwrite");
+          var store = tx.objectStore("filesystem");
+          var cursor = store.openCursor();
+          var record = null;
+          cursor.onerror = function () { db.close(); resolve(0); };
+          cursor.onsuccess = function (e) {
+            var c = e.target.result;
+            if (c) {
+              if (String(c.key) === "servers.dat") record = { key: c.key, value: c.value };
+              c.continue();
+              return;
+            }
+            if (!record) { db.close(); return resolve(0); }
+            var data = record.value.data;
+            var bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data);
+            var spans, decoder = new TextDecoder(), encoder = new TextEncoder();
+            try { spans = nbtStringSpans(bytes); } catch (err) { db.close(); return resolve(0); }
+            var hosts = [];
+            for (var i = 0; i < spans.length; i++) {
+              var span = spans[i];
+              if (!span.len || span.len > 253) continue;
+              var value = decoder.decode(bytes.subarray(span.at, span.at + span.len));
+              /* only a bare host is a Java address; "wss://..." and the entry names are left alone */
+              if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i.test(value)) continue;
+              hosts.push({ span: span, host: value.toLowerCase() });
+            }
+            if (!hosts.length) { db.close(); return resolve(0); }
+            Promise.all(hosts.map(function (h) {
+              return resolveSrv(h.host).catch(function () { return undefined; });
+            })).then(function (targets) {
+              var touched = [], edits = [];
+              for (var j = 0; j < hosts.length; j++) {
+                var target = targets[j];
+                if (!target) continue;
+                var parts = String(target).split(":");
+                var text = encoder.encode(parts[1] && parts[1] !== "25565" ? parts[0] : parts[0]);
+                if (text.length === hosts[j].span.len) continue;
+                edits.push({ at: hosts[j].span.at, len: hosts[j].span.len, text: text });
+                touched.push(hosts[j].host + " -> " + parts[0] + (parts[1] && parts[1] !== "25565" ? ":" + parts[1] : ""));
+              }
+              if (!edits.length) { db.close(); return resolve(0); }
+              var next = bytes;
+              edits.sort(function (a, b) { return b.at - a.at; });
+              for (var k = 0; k < edits.length; k++) next = spliceStringSpan(next, edits[k].at, edits[k].len, edits[k].text);
+              var buffer = next.buffer.slice(next.byteOffset, next.byteOffset + next.length);
+              var put = store.put({ path: record.value.path, data: buffer }, record.key);
+              put.onsuccess = function () {
+                window.wispcraftNote("server list repaired: " + touched.join(", "));
+                db.close();
+                resolve(edits.length);
+              };
+              put.onerror = function () { db.close(); resolve(0); };
+            }).catch(function () { db.close(); resolve(0); });
+          };
+        } catch (err) { try { db.close(); } catch (e) {} resolve(0); }
+      };
+    });
+  }
+  window.wispcraftRepairSavedServers = repairSavedServers;
 
   function dropQuickPlayParam() {
     try {
@@ -596,6 +650,7 @@
          a direct-connection hint, and two notes racing would leave whichever resolved last on screen */
       if (!target) addJavaServer(raw);
       dropQuickPlayParam();
+      repairSavedServers().catch(function () {});
     } catch (e) {}
   })();
 
