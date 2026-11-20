@@ -355,6 +355,23 @@ and the head script's `window.fetch` shim hands `sessionserver.mojang.com/sessio
 The access token therefore travels browser -> wisp relay -> Mojang: no third-party proxy, no token in
 a URL, nothing hosted for this.
 
+That export is **self-healing**: the epoxy client builds its wisp multiplexor once at boot, and when
+the relay drops it every later request fails in about a millisecond with
+`hyper_util::client::legacy::Error(Connect, Wisp(MuxTaskEnded))`. That is what turned a join which
+had already reached Minemen's encryption request into "Could not reach Minecraft session
+authentication". Patch 7 rebuilds the client exactly the way the settings UI does
+(`<ready> = new Promise(...)`, `JA(wispUrl)`, `replace_stream_provider()`) and retries once:
+
+```js
+A.fetchViaRelay = async function (u, i) {
+  try { return await LA(u, i) } catch (e) {
+    var m = String((e && e.message) || e);
+    if (/MuxTaskEnded|Multiplexor task ended/.test(m)) { await A.repairRelay(); return await LA(u, i) }
+    throw e
+  }
+};
+```
+
 Two related facts recorded while chasing the same failure:
 
 - `api.minecraftservices.com/minecraft/profile` is also CORS-blocked; the shim answers it from
@@ -363,3 +380,28 @@ Two related facts recorded while chasing the same failure:
 - Java hosts are SRV-only often enough that the bare domain is unusable: `_minecraft._tcp.minemen.club`
   -> `geo.minemen.club:25565`. `resolveSrv()` in the head script asks DNS-over-HTTPS (Cloudflare,
   falling back to Google), caches for six hours, and `addJavaServer`/`?server=` name the SRV target.
+
+## Joining a Java server without touching its entry
+
+Three separate things had to line up, and each one was measured before it was believed:
+
+1. **SRV before the relay dials** (patch 4). The bundle's `forward()` resolved `_minecraft._tcp.<host>`
+   with a fetch through its own epoxy client, so a dead multiplexor silently downgraded the dial to
+   the bare domain and the relay answered `Wisp destination connection timed out (code 1006)`. It now
+   asks `window.wispcraftResolveSrv` first and keeps the upstream lookup as a fallback.
+2. **Transport** (patches 5 and 6). Quick Play hands the host to the client as a plain address, and
+   the client dials `wss://<host>` - an EaglerX socket no Java server answers ("connection dropped
+   without a WebSocket close frame (code 1006)"). The game's networking runs in a wasm worker, so a
+   page-level socket rewrite cannot move it: patch 5 still routes a matching `wss://` into the Wisp
+   stream for anything that does go through the page proxy, and patch 6 lets the launcher *supply*
+   the entry instead - `eaglercraftXOpts` is read at startup, and this setter (which already injects
+   `settings://`) appends `window.wispcraftJavaEntry`, surviving the client's own later assignment of
+   the same property.
+3. **The parameter itself.** `?server=<host>` resolves the record, publishes
+   `java://<srv target>:<port>`, and then drops the query with `history.replaceState`, because the
+   client would otherwise fire its EaglerX quick play at the same host on top of a working entry.
+
+What this cannot do: rewrite the server list of a profile that already has an entry for the same
+server. That list belongs to the client, the saved list wins over the supplied one, and a page cannot
+reach it - an older entry pointing at the bare domain keeps timing out until it is redirected to the
+SRV host once (Edit -> address -> Done, Wisp mode already selected).

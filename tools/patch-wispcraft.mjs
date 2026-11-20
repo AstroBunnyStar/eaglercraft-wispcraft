@@ -2,7 +2,7 @@
 /**
  * Re-applies the local modifications to the vendored Wispcraft bundle (wispcraft.js).
  *
- * Two patches:
+ * Patches (see PATCHES.md for the measured behaviour behind each one):
  *   1. getProfile() diagnostics - the upstream bundle throws a bare
  *      `throw new Error("mc did not return a profile")`, which hides whether the
  *      account has no Java profile (404) or the token/relay was rejected (401/403).
