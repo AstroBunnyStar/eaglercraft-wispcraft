@@ -171,6 +171,60 @@ if (alreadyExported) {
   }
 }
 
+// ---------------------------------------------------------------- patch 4: SRV for every Java connect
+// The bundle resolves `_minecraft._tcp.<host>` with a fetch through its own epoxy client. That fetch
+// only works while the wisp multiplexor is healthy: when it is not, the SRV lookup throws, the catch
+// swallows it and the relay is asked for the bare host (minemen.club times out; geo.minemen.club is
+// the real target). The launcher page owns a two-provider resolver with a 6 hour cache, so prefer it
+// and keep the upstream lookup as the fallback.
+const SRV_MARKER = 'window.wispcraftResolveSrv=="function"';
+const SRV_ANCHOR = "async forward(A){let I;try{";
+
+if (js.includes(SRV_MARKER)) {
+  lines.push("[ok]   srv resolution patch already present");
+} else if (!js.includes(SRV_ANCHOR)) {
+  lines.push("[skip] srv resolution: the java forward() anchor was not found");
+} else {
+  const srvSrc =
+    "if(typeof window.wispcraftResolveSrv==\"function\"){try{var __srv=await window.wispcraftResolveSrv(this.url.hostname);" +
+    "if(__srv&&__srv.host){I=new URL(\"java://\"+__srv.host+\":\"+(__srv.port||25565))," +
+    "window.wispcraftNote&&window.wispcraftNote(\"srv \"+this.url.hostname+\" -> \"+__srv.host+\":\"+(__srv.port||25565))}}catch(e){}}";
+  js = js.replace(SRV_ANCHOR, SRV_ANCHOR + srvSrc);
+  changed++;
+  lines.push("[fix]  srv resolution routed through window.wispcraftResolveSrv");
+}
+
+// ---------------------------------------------------------------- patch 5: quick play opens in Wisp mode
+// Quick Play (?server=<host>) makes the client dial wss://<host>: an EaglerX socket, which no Java
+// server answers ("connection dropped without a WebSocket close frame (code 1006)"). The bundle's
+// window.WebSocket proxy is where the transport is chosen - java:// addresses become the Wisp stream
+// (VI) - so when the launcher publishes window.wispcraftJavaQuickPlay, the same host arriving as
+// wss:// is routed to the Wisp stream instead. The Wisp stream's own SRV step then applies the
+// _minecraft._tcp record, so minemen.club reaches geo.minemen.club:25565. The java:// URL shape is
+// the bundle's own double form: the proxy splits java://java://<host>:<port> into host "java" plus
+// the real address, which is what the stream class parses.
+const QP_MARKER = "window.wispcraftJavaQuickPlay";
+const QP_ANCHOR = 'return Q&&"settings"==B.hostname?new mI:new xI(g,C)}});';
+
+if (js.includes(QP_MARKER)) {
+  lines.push("[ok]   quick play wisp patch already present");
+} else if (!js.includes(QP_ANCHOR)) {
+  lines.push("[skip] quick play wisp: the WebSocket proxy tail was not found");
+} else {
+  const qpSrc =
+    'if(Q&&"settings"==B.hostname)return new mI;' +
+    'if("wss:"==B.protocol||"ws:"==B.protocol){var __qp=window.wispcraftJavaQuickPlay;' +
+    'if(__qp){var __h=String(B.hostname||"").toLowerCase(),__want=[__qp.request,__qp.host];' +
+    'if(__want.indexOf(__h)>=0||__want.indexOf(__h.replace(/^www\\./,""))>=0){' +
+    'var __s=new VI("java://java://"+__qp.host+":"+(__qp.port||25565));' +
+    'window.wispcraftNote&&window.wispcraftNote("quick play "+__h+" -> wisp "+__qp.host+":"+(__qp.port||25565));' +
+    'return __s.start(),__s}}}' +
+    'return new xI(g,C)}});';
+  js = js.replace(QP_ANCHOR, qpSrc);
+  changed++;
+  lines.push("[fix]  quick play routed into wisp mode for the launcher's java target");
+}
+
 // ---------------------------------------------------------------- validate before writing
 if (!fatal && changed) {
   const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "wispcraft-patch-")), "check.js");

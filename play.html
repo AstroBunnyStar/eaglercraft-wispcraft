@@ -392,6 +392,36 @@
   }
   /* reachable from the console and the tools, so an SRV answer can be checked without a joystick */
   window.wispcraftResolveSrv = resolveSrv;
+  /* Quick Play (play.html?server=<host>) hands the host to the client as a plain address, and the
+     client dials it as wss://<host> - an EaglerX socket, which no Java server answers, so the join
+     dies with "connection dropped without a WebSocket close frame (code 1006)". Wisp mode is the
+     only transport that speaks the Java protocol, and the bundle picks it in its own WebSocket
+     proxy for java:// addresses. Publishing the endpoint here lets that proxy turn the quick-play
+     socket into a Wisp socket for this one server, and the SRV record is applied first so the relay
+     is handed the address the server actually listens on (minemen.club -> geo.minemen.club:25565). */
+  window.wispcraftNote = function (msg) { try { console.log("[wispcraft] " + msg); } catch (e) {} };
+  function parseJavaTarget(raw) {
+    var text = String(raw == null ? "" : raw).trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+    if (!text || text.indexOf("/") > -1 || text.indexOf("?") > -1) return null;
+    var host = text.split(":")[0].toLowerCase();
+    if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(host)) return null;
+    var port = parseInt(String(text.split(":")[1] || "25565"), 10) || 25565;
+    return { request: host, host: host, port: port };
+  }
+  function armJavaQuickPlay(raw) {
+    var target = parseJavaTarget(raw);
+    if (!target) return null;
+    var state = window.wispcraftJavaQuickPlay = target;
+    resolveSrv(target.request).then(function (entry) {
+      if (!entry) return;
+      var parts = String(entry).split(":");
+      state.host = parts[0];
+      state.port = parseInt(parts[1] || "25565", 10) || 25565;
+      window.wispcraftNote("quick play " + target.request + " -> " + state.host + ":" + state.port + " (wisp)");
+    }).catch(function () {});
+    return state;
+  }
+  window.wispcraftArmJavaQuickPlay = armJavaQuickPlay;
   function javaAddress(raw) {
     var text = String(raw == null ? "" : raw).trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
     if (!text || text.indexOf("/") > -1 || text.indexOf("?") > -1) return null;
@@ -437,9 +467,8 @@
       var entry = target || bare;
       serverNote(host + " is a Java Minecraft server" +
         (target ? ", and _minecraft._tcp." + host + " points at " + entry : "") +
-        ". In Direct Connection (or Add Server) enter " + entry + " and click Wisp - that is what" +
-        " sends java://" + entry + " through the wisp relay, instead of a plain wss:// address" +
-        " that no Minecraft server answers.");
+        ". Quick Play and Join Server both open it in Wisp mode (" + entry +
+        "), which is the only transport that speaks the Java protocol.");
     });
     return addr;
   }
@@ -447,7 +476,11 @@
   (function () {
     var asked = /[?&]server=([^&]+)/.exec(location.search);
     if (!asked) return;
-    try { addJavaServer(decodeURIComponent(asked[1])); } catch (e) {}
+    try {
+      var raw = decodeURIComponent(asked[1].replace(/\+/g, " "));
+      armJavaQuickPlay(raw);
+      addJavaServer(raw);
+    } catch (e) {}
   })();
 
   /* Connecting needs the account object, and the client refreshes it with a plain fetch to
