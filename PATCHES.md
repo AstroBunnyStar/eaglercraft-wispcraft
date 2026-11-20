@@ -241,6 +241,29 @@ so a signed-out-but-stale browser is given a relay that can complete the Microso
 Verified on a local build: expired token → panel opens with a code, fresh token → no panel, no
 account → panel opens; the client still boots to its menu behind the panel in every case.
 
+## Java servers without the `java://` prefix (`play.html` head script)
+
+Direct Connection offers only `wss://` and `ws://`; `java://` hides behind its **Wisp** mode button.
+A real Java server typed in the other modes is therefore dialled as `wss://minemen.club`, which no
+Minecraft server answers - the socket drops, and the client reports it in the same words a stale
+token produces, which is why it reads as an auth problem.
+
+`javaAddress()` recognises a known Java host (`hypixel.net`, `minemen.club`, `cubecraft.net`,
+`2b2t.org`, subdomains included) with no path and no query, and `play.html?server=minemen.club`
+turns it into `java://minemen.club` and says so: the player is told that entering the host and
+picking **Wisp** is what routes it through the wisp relay.
+
+The entry itself cannot be created for them. The client keeps its server list in its own filesystem
+database (not localStorage, and not in the IndexedDB stores this page can see), and once it starts
+its networking runs in a blob worker - the initiator stack of a connection attempt is an inline
+script plus wasm frames, and the page's WebSocket proxy never sees it, so neither the launcher nor
+the bundled `wispcraft.js` can rewrite the address as it is dialled. What the launcher *can* do is
+state the one step that works, and for a shared link to open on it.
+
+Verified: `_minecraft._tcp.minemen.club` is `geo.minemen.club:25565`, and a Minecraft status ping
+through `wss://truffled.lol/wisp/` answers as Minemen Club (1200+ players), so the relay path itself
+is sound; in Wisp mode the client opens the relay socket and no `wss://minemen.club` attempt at all.
+
 ## Signed-in identity pinning (`play.html` head script)
 
 The client keeps the launch identity in two places, and both have to agree before it boots or a

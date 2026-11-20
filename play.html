@@ -201,7 +201,7 @@
       try {
         if (sessionStorage.getItem(SKIN_RELOAD)) return;
         sessionStorage.setItem(SKIN_RELOAD, "1");
-        location.reload();
+        if (!signInPending()) location.reload();
       } catch (e) {}
     });
   }
@@ -331,6 +331,66 @@
     });
   }
 
+  /* Direct Connection offers only wss:// and ws:// - java:// is reachable only through its "Wisp"
+     mode - so a known Java server typed without the prefix is dialled as wss://<host>. Nothing
+     answers that, the socket drops, and the player reads it as a failed login ("you need a
+     Microsoft authenticated account"). Once the client starts, its networking runs in a blob
+     worker out of this page's reach, so the host is placed in the client's own server list as
+     java://<host> before the client boots: play.html?server=minemen.club. Joining that entry goes
+     through the wisp relay, and the player is told that it happened. */
+  var JAVA_SERVERS = ["hypixel.net", "minemen.club", "cubecraft.net", "2b2t.org"];
+  function javaAddress(raw) {
+    var text = String(raw == null ? "" : raw).trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+    if (!text || text.indexOf("/") > -1 || text.indexOf("?") > -1) return null;
+    var host = text.split(":")[0].toLowerCase(), port = text.split(":")[1] || "";
+    if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(host)) return null;
+    var known = false;
+    for (var i = 0; i < JAVA_SERVERS.length; i++) {
+      var d = JAVA_SERVERS[i];
+      if (host === d || host.slice(-(d.length + 1)) === "." + d) { known = true; break; }
+    }
+    if (!known) return null;
+    return "java://" + host + (port && port !== "25565" ? ":" + port : "");
+  }
+  function serverNote(text) {
+    try {
+      var id = "wispcraft_java_note", el = document.getElementById(id);
+      if (!el) {
+        el = document.createElement("div");
+        el.id = id;
+        el.setAttribute("role", "status");
+        el.style.cssText = "position:fixed;left:50%;top:18px;transform:translateX(-50%);" +
+          "z-index:2147483647;max-width:min(92vw,620px);padding:10px 14px;border-radius:8px;" +
+          "background:rgba(10,12,18,.95);border:1px solid rgba(130,160,255,.5);color:#e6ecff;" +
+          "font:13px/1.45 ui-monospace,Menlo,monospace;text-align:center;" +
+          "box-shadow:0 10px 30px rgba(0,0,0,.55)";
+        (document.body || document.documentElement).appendChild(el);
+      }
+      el.textContent = text;
+      el.style.display = "block";
+      clearTimeout(serverNote.timer);
+      serverNote.timer = setTimeout(function () { el.style.display = "none"; }, 12000);
+    } catch (e) {}
+  }
+  function addJavaServer(raw) {
+    var addr = javaAddress(raw);
+    if (!addr) return null;
+    var host = addr.replace(/^java:\/\//, "").split(":")[0];
+    /* The client keeps its server list in its own filesystem database, and once it starts its
+       networking runs in a blob worker this page cannot reach, so no entry can be created from
+       here. What can be done is say the one step that makes the join work. */
+    serverNote(host + " is a Java Minecraft server. In Direct Connection (or Add Server) enter " +
+      host + " and click Wisp - that is what sends " + addr + " through the wisp relay, instead of a" +
+      " plain wss:// address that no Minecraft server answers.");
+    return addr;
+  }
+
+  (function () {
+    var asked = /[?&]server=([^&]+)/.exec(location.search);
+    if (!asked) return;
+    try { addJavaServer(decodeURIComponent(asked[1])); } catch (e) {}
+  })();
+
   seedAuthstore();
   seedAccountSkin();
 
@@ -338,7 +398,16 @@
      the boot branch and the sign-in watcher both fall back to the panel instead of booting a
      player who will be kicked by the first online-mode server they try. */
   function signedIn() { return accountUsable(); }
+  /* The device code is collected by the poll running in this page, so a reload between approval and
+     collection throws the sign-in away - which looks like "I signed in and it still says I need an
+     account". While a code is on screen (or the Add button is disabled because a poll is running),
+     nothing here is allowed to reload. */
+  function signInPending() {
+    var btn = document.getElementById("addbutton"), code = document.getElementById("auth_code");
+    return !!(btn && btn.disabled) || !!(code && code.value);
+  }
   function reloadOnce() {
+    if (signInPending()) return;
     try { if (sessionStorage.getItem(SEEN)) return; sessionStorage.setItem(SEEN, "1"); } catch (e) {}
     location.reload();
   }
