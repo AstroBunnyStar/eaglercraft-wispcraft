@@ -422,6 +422,45 @@
     return state;
   }
   window.wispcraftArmJavaQuickPlay = armJavaQuickPlay;
+  /* Quick Play dials wss://<host> - an EaglerX socket - and the client's networking runs in a wasm
+     worker this page cannot patch, so no page-level socket rewrite can move that join onto Wisp.
+     What the page can do is put the server in the client's own list before it boots: window
+     eaglercraftXOpts is read by the client at startup, and an entry in the bundle's java:// scheme
+     is the one that goes through the wisp relay (the transport that speaks the Java protocol), with
+     the SRV endpoint in place so a domain like minemen.club reaches geo.minemen.club:25565. The
+     quick-play parameter is then dropped, because the client would otherwise fire an EaglerX join at
+     the same host and fail with "code 1006" over the top of a working entry. */
+  /* The bundle's eaglercraftXOpts setter builds the server list, and the client assigns that
+     property again while it boots - so the entry is published for that setter (see the bundle patch)
+     rather than written into the list here, where the next assignment would replace it. */
+  function installJavaEntry(host, port, label) {
+    try {
+      window.wispcraftJavaEntry = { addr: "java://" + host + ":" + (port || 25565), name: label || host };
+      var base = window.eaglercraftXOpts;
+      if (!base) return false;
+      window.eaglercraftXOpts = {
+        container: base.container || "game_frame",
+        worldsDB: base.worldsDB || "worlds",
+        relays: base.relays || []
+      };
+      return true;
+    } catch (e) { return false; }
+  }
+  function armJavaEntry(raw) {
+    var target = parseJavaTarget(raw);
+    if (!target) return null;
+    installJavaEntry(target.host, target.port, target.request);
+    resolveSrv(target.request).then(function (entry) {
+      if (!entry) return;
+      var parts = String(entry).split(":");
+      var port = parseInt(parts[1] || "25565", 10) || 25565;
+      installJavaEntry(parts[0], port, target.request);
+      window.wispcraftNote(target.request + " is in your server list in Wisp mode (java://" + parts[0] +
+        ":" + port + ") - press Multiplayer, select it and Join Server.");
+    }).catch(function () {});
+    return target;
+  }
+  window.wispcraftArmJavaEntry = armJavaEntry;
   function javaAddress(raw) {
     var text = String(raw == null ? "" : raw).trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
     if (!text || text.indexOf("/") > -1 || text.indexOf("?") > -1) return null;
@@ -479,7 +518,9 @@
     try {
       var raw = decodeURIComponent(asked[1].replace(/\+/g, " "));
       armJavaQuickPlay(raw);
+      armJavaEntry(raw);
       addJavaServer(raw);
+      try { history.replaceState(null, "", location.pathname + location.hash); } catch (e) {}
     } catch (e) {}
   })();
 

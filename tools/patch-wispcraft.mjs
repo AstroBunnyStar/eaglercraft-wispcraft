@@ -225,6 +225,30 @@ if (js.includes(QP_MARKER)) {
   lines.push("[fix]  quick play routed into wisp mode for the launcher's java target");
 }
 
+// ---------------------------------------------------------------- patch 6: launcher-supplied server entry
+// The launcher cannot write the client's server list (the client owns it), and the client's own
+// networking runs in a wasm worker a page cannot patch, so Quick Play cannot be moved onto Wisp from
+// the page. What the launcher can do is hand the client an entry: eaglercraftXOpts is read at
+// startup, and this setter is where the list is built (it already injects the settings:// entry).
+// Appending window.wispcraftJavaEntry here survives the client's own later assignment of the same
+// property, which would otherwise replace the list and drop the entry.
+const ENTRY_MARKER = 'window.wispcraftJavaEntry&&';
+const ENTRY_ANCHOR = 'set(A){$I=A,$I?.servers?$I.servers.unshift(Ag):$I.servers=[Ag]}';
+
+if (js.includes(ENTRY_MARKER)) {
+  lines.push("[ok]   launcher server entry patch already present");
+} else if (!js.includes(ENTRY_ANCHOR)) {
+  lines.push("[skip] launcher server entry: the eaglercraftXOpts setter was not found");
+} else {
+  const entrySrc =
+    'set(A){$I=A,$I?.servers?$I.servers.unshift(Ag):$I.servers=[Ag],' +
+    'window.wispcraftJavaEntry&&($I.servers.push(window.wispcraftJavaEntry),' +
+    'window.wispcraftNote&&window.wispcraftNote("server list: added "+window.wispcraftJavaEntry.addr))}';
+  js = js.replace(ENTRY_ANCHOR, entrySrc);
+  changed++;
+  lines.push("[fix]  launcher-supplied server entry appended to eaglercraftXOpts.servers");
+}
+
 // ---------------------------------------------------------------- validate before writing
 if (!fatal && changed) {
   const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "wispcraft-patch-")), "check.js");
