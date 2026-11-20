@@ -171,6 +171,48 @@ if (alreadyExported) {
   }
 }
 
+// ---------------------------------------------------------------- patch 7: the relay fetch heals itself
+// The epoxy client owns one wisp multiplexor, created once at boot. When the relay drops it (an idle
+// page, or the game's own wisp join closing the socket) every later request fails in 1 ms with
+// `Wisp(MuxTaskEnded)` - which is what turns a working session join into "Could not reach Minecraft
+// session authentication". The settings UI already knows how to rebuild it (a fresh client plus
+// replace_stream_provider), so the exported fetch retries through that once before giving up.
+const RELAY_REPAIR = "repairRelay";
+const repairMatch = js.match(
+  /async function ([A-Za-z_$][\w$]*)\(A,I\)\{return await ([A-Za-z_$][\w$]*),await ([A-Za-z_$][\w$]*)\.fetch\(/
+);
+const readyMatch = js.match(/([A-Za-z_$][\w$]*)=new Promise\(A=>([A-Za-z_$][\w$]*)=A\)/);
+/* the init function is the async function that constructs the client: `KA=new NA(A,I)` */
+function findInitFn(clientVar) {
+  const at = js.search(new RegExp("\\b" + clientVar.replace(/\$/g, "\\$") + "=new [A-Za-z_$][\\w$]*\\(A,I\\)"));
+  if (at < 0) return null;
+  const head = js.slice(Math.max(0, at - 500), at);
+  const found = [...head.matchAll(/async function ([A-Za-z_$][\w$]*)\s*\(A\)\s*\{/g)];
+  return found.length ? found[found.length - 1][1] : null;
+}
+const initFn = repairMatch ? findInitFn(repairMatch[3]) : null;
+const exportMatch = js.match(/([A-Za-z_$][\w$]*)\.fetchViaRelay=function\(u,i\)\{return ([A-Za-z_$][\w$]*)\(u,i\)\};/);
+
+if (js.includes('.' + RELAY_REPAIR + '=')) {
+  lines.push("[ok]   relay repair patch already present");
+} else if (!repairMatch || !readyMatch || !initFn || !exportMatch) {
+  lines.push("[skip] relay repair: could not resolve the epoxy client, its ready promise or the init function");
+} else {
+  const [, fetchFn, readyPromise, client] = repairMatch;
+  const [, promiseId, resolver] = readyMatch;
+  const ns = exportMatch[1];
+  const repair =
+    `${ns}.${RELAY_REPAIR}=async function(){try{${promiseId}=new Promise(function(r){${resolver}=r}),` +
+    `${initFn}(${ns}.wispUrl),await ${promiseId},await ${client}.replace_stream_provider();return true}` +
+    `catch(e){return String((e&&e.message)||e)}};\n` +
+    `${ns}.fetchViaRelay=async function(u,i){try{return await ${fetchFn}(u,i)}catch(e){` +
+    `var m=String((e&&e.message)||e);if(/MuxTaskEnded|Multiplexor task ended/.test(m)){` +
+    `await ${ns}.${RELAY_REPAIR}();return await ${fetchFn}(u,i)}throw e}};`;
+  js = js.replace(exportMatch[0], repair);
+  changed++;
+  lines.push(`[fix]  relay fetch retries through a rebuilt multiplexor (${client}, ${initFn}, ${promiseId})`);
+}
+
 // ---------------------------------------------------------------- patch 4: SRV for every Java connect
 // The bundle resolves `_minecraft._tcp.<host>` with a fetch through its own epoxy client. That fetch
 // only works while the wisp multiplexor is healthy: when it is not, the SRV lookup throws, the catch
