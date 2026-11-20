@@ -10,6 +10,14 @@
  *   2. Built-in relay default - pins the bundle's fallback relay to the same value
  *      the launcher page ships as DEFAULT, which is read out of index.html so a replaced bundle
  *      cannot drift from the launcher (and --check needs no extra flag).
+ *   3. Relay fetch export - publishes the epoxy client on the launcher namespace so a page can reach
+ *      an endpoint that sends no CORS headers (the session join).
+ *   7. Relay repair - rebuilds the multiplexor once when it has ended, then retries the request.
+ *   4. SRV resolution - asks the launcher's cached resolver before the relay dials a Java host.
+ *   5. Quick play transport - a matching wss:// address is routed into the Wisp stream.
+ *   6. Server entry - appends the launcher's java:// entry to the list the client builds at boot.
+ * 7 before 4/5/6 because it rewrites the line patch 3 leaves behind; the numbers otherwise follow
+ * the order they were added to the launcher, not the order they run.
  *
  * Usage:
  *   node tools/patch-wispcraft.mjs                 # patch ./wispcraft.js
@@ -201,10 +209,15 @@ if (js.includes('.' + RELAY_REPAIR + '=')) {
   const [, fetchFn, readyPromise, client] = repairMatch;
   const [, promiseId, resolver] = readyMatch;
   const ns = exportMatch[1];
+  /* single flight: the profile and session requests fail together, and rebuilding the client twice
+     at once would swap the multiplexor out from under the first repair */
   const repair =
-    `${ns}.${RELAY_REPAIR}=async function(){try{${promiseId}=new Promise(function(r){${resolver}=r}),` +
+    `${ns}.${RELAY_REPAIR}=function(){if(!${ns}.__repairPending){` +
+    `var p=${ns}.__repairPending=(async function(){try{${promiseId}=new Promise(function(r){${resolver}=r}),` +
     `${initFn}(${ns}.wispUrl),await ${promiseId},await ${client}.replace_stream_provider();return true}` +
-    `catch(e){return String((e&&e.message)||e)}};\n` +
+    `catch(e){return String((e&&e.message)||e)}})();` +
+    `p.then(function(){if(${ns}.__repairPending===p)${ns}.__repairPending=null})}` +
+    `return ${ns}.__repairPending};\n` +
     `${ns}.fetchViaRelay=async function(u,i){try{return await ${fetchFn}(u,i)}catch(e){` +
     `var m=String((e&&e.message)||e);if(/MuxTaskEnded|Multiplexor task ended/.test(m)){` +
     `await ${ns}.${RELAY_REPAIR}();return await ${fetchFn}(u,i)}throw e}};`;

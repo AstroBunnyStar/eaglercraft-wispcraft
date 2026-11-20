@@ -405,7 +405,8 @@
     if (!text || text.indexOf("/") > -1 || text.indexOf("?") > -1) return null;
     var host = text.split(":")[0].toLowerCase();
     if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(host)) return null;
-    var port = parseInt(String(text.split(":")[1] || "25565"), 10) || 25565;
+    var portNum = parseInt(String(text.split(":")[1] || "25565"), 10);
+    var port = portNum > 0 && portNum < 65536 ? portNum : 25565;
     return { request: host, host: host, port: port };
   }
   function armJavaQuickPlay(raw) {
@@ -424,25 +425,26 @@
   window.wispcraftArmJavaQuickPlay = armJavaQuickPlay;
   /* Quick Play dials wss://<host> - an EaglerX socket - and the client's networking runs in a wasm
      worker this page cannot patch, so no page-level socket rewrite can move that join onto Wisp.
-     What the page can do is put the server in the client's own list before it boots: window
-     eaglercraftXOpts is read by the client at startup, and an entry in the bundle's java:// scheme
-     is the one that goes through the wisp relay (the transport that speaks the Java protocol), with
-     the SRV endpoint in place so a domain like minemen.club reaches geo.minemen.club:25565. The
-     quick-play parameter is then dropped, because the client would otherwise fire an EaglerX join at
-     the same host and fail with "code 1006" over the top of a working entry. */
-  /* The bundle's eaglercraftXOpts setter builds the server list, and the client assigns that
-     property again while it boots - so the entry is published for that setter (see the bundle patch)
-     rather than written into the list here, where the next assignment would replace it. */
+     What the page can do is put the server in the client's own list before it boots. The bundle's
+     eaglercraftXOpts setter builds that list, and the client assigns the property again while it
+     boots, so the entry is published for that setter (bundle patch 6) rather than written into the
+     list here, where the next assignment would replace it. The quick-play parameter is dropped
+     afterwards: the client would otherwise fire an EaglerX join at the same host on top of a
+     working entry. */
   function installJavaEntry(host, port, label) {
     try {
       window.wispcraftJavaEntry = { addr: "java://" + host + ":" + (port || 25565), name: label || host };
       var base = window.eaglercraftXOpts;
       if (!base) return false;
-      window.eaglercraftXOpts = {
-        container: base.container || "game_frame",
-        worldsDB: base.worldsDB || "worlds",
-        relays: base.relays || []
-      };
+      /* carry every option the caller already set (assets, container, language) and only drop the
+         list, so the setter rebuilds it with this entry in it */
+      var next = {};
+      for (var k in base) {
+        if (Object.prototype.hasOwnProperty.call(base, k) && k !== "servers") next[k] = base[k];
+      }
+      if (!next.container) next.container = "game_frame";
+      if (!next.worldsDB) next.worldsDB = "worlds";
+      window.eaglercraftXOpts = next;
       return true;
     } catch (e) { return false; }
   }
@@ -512,15 +514,28 @@
     return addr;
   }
 
+  /* remove only the quick-play parameter: anything else in the query (a pinned relay, a language)
+     belongs to the player and must survive */
+  function dropQuickPlayParam() {
+    try {
+      var kept = location.search.replace(/^\?/, "").split("&").filter(function (part) {
+        return part && !/^server=/.test(part);
+      });
+      history.replaceState(null, "", location.pathname + (kept.length ? "?" + kept.join("&") : "") + location.hash);
+    } catch (e) {}
+  }
+
   (function () {
     var asked = /[?&]server=([^&]+)/.exec(location.search);
     if (!asked) return;
     try {
       var raw = decodeURIComponent(asked[1].replace(/\+/g, " "));
+      var target = armJavaEntry(raw);
       armJavaQuickPlay(raw);
-      armJavaEntry(raw);
-      addJavaServer(raw);
-      try { history.replaceState(null, "", location.pathname + location.hash); } catch (e) {}
+      /* the entry path says everything there is to say about this host; the older helper only adds
+         a direct-connection hint, and two notes racing would leave whichever resolved last on screen */
+      if (!target) addJavaServer(raw);
+      dropQuickPlayParam();
     } catch (e) {}
   })();
 
