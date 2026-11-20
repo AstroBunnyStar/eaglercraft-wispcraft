@@ -304,6 +304,28 @@ if (js.includes(ENTRY_MARKER)) {
   lines.push("[fix]  launcher-supplied server entry appended to eaglercraftXOpts.servers");
 }
 
+// ---------------------------------------------------------------- patch 8: SRV for whatever an entry holds
+// The relay dials the CONNECT target verbatim, so an entry stored as a bare domain keeps timing out
+// even though the launcher knows the SRV record. The relay socket is created here (the proxy branch
+// for the wisp URL), so the launcher is handed every frame the client sends: a CONNECT for port
+// 25565 can then be rewritten to the record's target before it leaves the page. HTTPS through the
+// same relay is untouched (port 443 fails the check), and so is any frame that is not a CONNECT.
+const WISP_REWRITE_MARKER = "wispcraftRewriteWispTarget";
+const WISP_REWRITE_ANCHOR = "if(g==A.wispUrl)return new XI(g,C);";
+
+if (js.includes(WISP_REWRITE_MARKER)) {
+  lines.push("[ok]   relay target rewrite already present");
+} else if (!js.includes(WISP_REWRITE_ANCHOR)) {
+  lines.push("[skip] relay target rewrite: the wisp-URL branch of the WebSocket proxy was not found");
+} else {
+  const rewriteSrc =
+    "if(g==A.wispUrl){var __relaySock=new XI(g,C);" +
+    "return window." + WISP_REWRITE_MARKER + "?window." + WISP_REWRITE_MARKER + "(__relaySock):__relaySock}";
+  js = js.replace(WISP_REWRITE_ANCHOR, rewriteSrc);
+  changed++;
+  lines.push("[fix]  relay socket handed to the launcher's CONNECT target rewriter");
+}
+
 // ---------------------------------------------------------------- validate before writing
 if (!fatal && changed) {
   const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "wispcraft-patch-")), "check.js");

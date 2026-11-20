@@ -516,6 +516,66 @@
 
   /* remove only the quick-play parameter: anything else in the query (a pinned relay, a language)
      belongs to the player and must survive */
+  /* Whatever an entry holds, the relay dials it verbatim: an entry saved as "minemen.club" asks the
+     relay for minemen.club:25565, which nothing answers, because the server only listens on its SRV
+     target. The wisp CONNECT packet is page-visible - the bundle's WebSocket proxy creates the relay
+     socket - so the target is rewritten here instead: only when the packet really is a CONNECT for
+     port 25565, host taken from the packet itself, record applied from the cache or resolved once.
+     Anything that does not parse as such a packet is passed through byte for byte. */
+  window.wispcraftRewriteWispTarget = function (socket) {
+    var send = socket.send.bind(socket);
+    var encoder = new TextEncoder(), decoder = new TextDecoder();
+    function parse(view) {
+      if (!view || view.length < 10 || view[0] !== 1 || view[5] !== 1) return null;
+      var len = view[6], end = 7 + len;
+      if (len === 0 || end + 2 > view.length) return null;
+      var host = decoder.decode(view.subarray(7, end)).toLowerCase();
+      if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(host)) return null;
+      var port = view[end] | (view[end + 1] << 8);
+      if (port !== 25565) return null;
+      return { host: host, end: end, view: view };
+    }
+    function build(parsed, target) {
+      var parts = String(target).split(":");
+      var host = parts[0], port = parseInt(parts[1] || "25565", 10) || 25565;
+      var bytes = encoder.encode(host);
+      var out = new Uint8Array(parsed.view.length - (parsed.end - 7) + bytes.length);
+      out.set(parsed.view.subarray(0, 6), 0);
+      out[6] = bytes.length;
+      out.set(bytes, 7);
+      out.set(parsed.view.subarray(parsed.end), 7 + bytes.length);
+      out[7 + bytes.length] = port & 0xff;
+      out[8 + bytes.length] = (port >> 8) & 0xff;
+      return out;
+    }
+    function deliver(original, buffer) {
+      return send(buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length));
+    }
+    socket.send = function (data) {
+      var view = null;
+      try {
+        if (data instanceof ArrayBuffer) view = new Uint8Array(data);
+        else if (data && data.buffer instanceof ArrayBuffer) view = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      } catch (e) { view = null; }
+      var parsed = view && parse(view);
+      if (!parsed) return send(data);
+      var cached = srvCached(parsed.host);
+      if (cached !== undefined) {
+        if (!cached) return send(data);
+        window.wispcraftNote("relay target " + parsed.host + " -> " + cached);
+        return deliver(data, build(parsed, cached));
+      }
+      /* first sight of this host: hold the CONNECT for the one lookup, then send exactly one frame */
+      resolveSrv(parsed.host).then(function (target) {
+        if (!target) return send(data);
+        window.wispcraftNote("relay target " + parsed.host + " -> " + target);
+        deliver(data, build(parsed, target));
+      }).catch(function () { send(data); });
+      return undefined;
+    };
+    return socket;
+  };
+
   function dropQuickPlayParam() {
     try {
       var kept = location.search.replace(/^\?/, "").split("&").filter(function (part) {
