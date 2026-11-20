@@ -143,6 +143,34 @@ if (alreadyApplied) {
   }
 }
 
+// ---------------------------------------------------------------- patch 3: expose the relay fetch
+// The bundle owns an epoxy client (a full HTTP client that speaks HTTPS through the wisp relay), so
+// it can reach endpoints a page cannot - sessionserver.mojang.com sends no CORS headers, which is
+// what kills an online-mode join. The client itself is module-scoped; this publishes it on the
+// launcher namespace so the page's fetch shim can hand those requests to the relay instead of a
+// third-party proxy. The identifier is discovered from the `return await <A>,await <B>.fetch(` shape.
+const RELAY_MARKER = ".fetchViaRelay=";
+const nsId = (js.match(/([A-Za-z_$][\w$]*)\.wispUrl\s*=/) || [])[1];
+const fetchFn = (js.match(/function\s+([A-Za-z_$][\w$]*)\s*\([^)]{0,24}\)\s*\{\s*return await [A-Za-z_$][\w$]*,\s*await [A-Za-z_$][\w$]*\.fetch\(/) || [])[1];
+
+const alreadyExported = nsId && new RegExp("\\n" + nsId.replace(/\$/g, "\\$") + "\\.fetchViaRelay=").test(js);
+if (alreadyExported) {
+  lines.push("[ok]   relay fetch export already present");
+} else if (!nsId || !fetchFn) {
+  lines.push("[skip] relay fetch export: could not find the namespace or the relay-fetch helper");
+} else {
+  /* the namespace object owns wispUrl, so this line is module scope: a function declared later is
+     hoisted, and the closure only runs when a request is actually made */
+  const anchor = new RegExp(`(${nsId.replace(/\$/g, "\\$")}\\.wispUrl\\s*=\\s*void 0;)`);
+  if (!anchor.test(js)) {
+    lines.push("[skip] relay fetch export: no `<ns>.wispUrl=void 0` anchor at module scope");
+  } else {
+    js = js.replace(anchor, `$1\n${nsId}.fetchViaRelay=function(u,i){return ${fetchFn}(u,i)};`);
+    changed++;
+    lines.push(`[fix]  relay fetch exported as ${nsId}.fetchViaRelay (helper ${fetchFn})`);
+  }
+}
+
 // ---------------------------------------------------------------- validate before writing
 if (!fatal && changed) {
   const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "wispcraft-patch-")), "check.js");

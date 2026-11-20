@@ -333,3 +333,33 @@ Tradeoffs, in order of importance:
   the editor stays picked;
 - it also changes what servers receive: the player now wears the custom skin instead of a preset,
   which is the intent for an account that owns that skin.
+
+## Session join through the relay
+
+`sessionserver.mojang.com/session/minecraft/join` sends no CORS headers, so a page cannot POST to it
+and every online-mode join died with *"Failed to log in: Could not reach Minecraft session
+authentication."* Faking the 204 locally is not an option - the server calls `hasJoined` and would
+answer "Failed to verify username" - so the request has to leave the page.
+
+The bundle already ships an epoxy client (`class NA`, wasm) that speaks HTTPS **through the wisp
+relay**: `epoxyclient_fetch`, reached by every `LA(...)` call, which is how the Microsoft device-code
+endpoint works from a page at all. `tools/patch-wispcraft.mjs` patch 3 publishes that client on the
+launcher namespace:
+
+```js
+A.wispUrl = void 0;
+A.fetchViaRelay = function (u, i) { return LA(u, i); };
+```
+
+and the head script's `window.fetch` shim hands `sessionserver.mojang.com/session/minecraft/*` to it.
+The access token therefore travels browser -> wisp relay -> Mojang: no third-party proxy, no token in
+a URL, nothing hosted for this.
+
+Two related facts recorded while chasing the same failure:
+
+- `api.minecraftservices.com/minecraft/profile` is also CORS-blocked; the shim answers it from
+  `wispcraft_profile_cache` (written during sign-in) instead of letting the client conclude the
+  account is unusable ("Wispcraft account is not ready").
+- Java hosts are SRV-only often enough that the bare domain is unusable: `_minecraft._tcp.minemen.club`
+  -> `geo.minemen.club:25565`. `resolveSrv()` in the head script asks DNS-over-HTTPS (Cloudflare,
+  falling back to Google), caches for six hours, and `addJavaServer`/`?server=` name the SRV target.

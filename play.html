@@ -339,6 +339,59 @@
      java://<host> before the client boots: play.html?server=minemen.club. Joining that entry goes
      through the wisp relay, and the player is told that it happened. */
   var JAVA_SERVERS = ["hypixel.net", "minemen.club", "cubecraft.net", "2b2t.org"];
+  /* Java servers advertise their real endpoint in an SRV record - minemen.club lists
+     geo.minemen.club:25565 in _minecraft._tcp.minemen.club - and the wisp relay dials whatever host
+     it is handed, verbatim, so "minemen.club" becomes an address nothing answers and the ping dies
+     with "Wisp destination connection timed out (code 1006)". The client's socket lives in a blob
+     worker this page cannot patch, so the record is resolved here, over DNS-over-HTTPS, and the
+     target is what the player is told to enter. Cached for six hours. */
+  var SRV_CACHE = "wispcraft_srv_cache", SRV_TTL = 6 * 60 * 60 * 1000;
+  function srvCached(host) {
+    try {
+      var all = JSON.parse(localStorage.getItem(SRV_CACHE) || "{}"), hit = all[host];
+      if (hit && typeof hit.at === "number" && Date.now() - hit.at < SRV_TTL) return hit.target;
+    } catch (e) {}
+    return undefined;
+  }
+  function srvFromAnswer(answer, host) {
+    var best = null;
+    for (var i = 0; i < answer.length; i++) {
+      var m = /^(\d+)\s+(\d+)\s+(\d+)\s+(\S+?)\.?$/.exec(String(answer[i].data || "").replace(/\s+/g, " ").trim());
+      if (!m) continue;
+      var prio = parseInt(m[1], 10), port = parseInt(m[3], 10), target = m[4].toLowerCase();
+      if (!target || target === ".") continue;
+      if (!best || prio < best.prio) best = { prio: prio, port: port, target: target };
+    }
+    if (!best || best.target === host) return null;
+    return best.target + (best.port && best.port !== 25565 ? ":" + best.port : "");
+  }
+  function resolveSrv(host) {
+    var cached = srvCached(host);
+    if (cached !== undefined) return Promise.resolve(cached);
+    var name = encodeURIComponent("_minecraft._tcp." + host);
+    var endpoints = [
+      "https://cloudflare-dns.com/dns-query?name=" + name + "&type=SRV",
+      "https://dns.google/resolve?name=" + name + "&type=SRV"
+    ];
+    function ask(i) {
+      if (i >= endpoints.length) return Promise.resolve(undefined);
+      return fetch(endpoints[i], { headers: { accept: "application/dns-json" } }).then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      }).then(function (json) {
+        var target = srvFromAnswer((json && json.Answer) || [], host);
+        try {
+          var all = JSON.parse(localStorage.getItem(SRV_CACHE) || "{}");
+          all[host] = { at: Date.now(), target: target };
+          localStorage.setItem(SRV_CACHE, JSON.stringify(all));
+        } catch (e) {}
+        return target;
+      }).catch(function () { return ask(i + 1); });
+    }
+    return ask(0);
+  }
+  /* reachable from the console and the tools, so an SRV answer can be checked without a joystick */
+  window.wispcraftResolveSrv = resolveSrv;
   function javaAddress(raw) {
     var text = String(raw == null ? "" : raw).trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
     if (!text || text.indexOf("/") > -1 || text.indexOf("?") > -1) return null;
@@ -375,13 +428,19 @@
   function addJavaServer(raw) {
     var addr = javaAddress(raw);
     if (!addr) return null;
-    var host = addr.replace(/^java:\/\//, "").split(":")[0];
+    var bare = addr.replace(/^java:\/\//, ""), host = bare.split(":")[0];
     /* The client keeps its server list in its own filesystem database, and once it starts its
        networking runs in a blob worker this page cannot reach, so no entry can be created from
-       here. What can be done is say the one step that makes the join work. */
-    serverNote(host + " is a Java Minecraft server. In Direct Connection (or Add Server) enter " +
-      host + " and click Wisp - that is what sends " + addr + " through the wisp relay, instead of a" +
-      " plain wss:// address that no Minecraft server answers.");
+       here. What can be done is say the one step that makes the join work - with the host the SRV
+       record points at, because a bare domain that is SRV-only times out at the relay. */
+    resolveSrv(host).then(function (target) {
+      var entry = target || bare;
+      serverNote(host + " is a Java Minecraft server" +
+        (target ? ", and _minecraft._tcp." + host + " points at " + entry : "") +
+        ". In Direct Connection (or Add Server) enter " + entry + " and click Wisp - that is what" +
+        " sends java://" + entry + " through the wisp relay, instead of a plain wss:// address" +
+        " that no Minecraft server answers.");
+    });
     return addr;
   }
 
@@ -390,6 +449,47 @@
     if (!asked) return;
     try { addJavaServer(decodeURIComponent(asked[1])); } catch (e) {}
   })();
+
+  /* Connecting needs the account object, and the client refreshes it with a plain fetch to
+     api.minecraftservices.com/minecraft/profile - which CORS blocks for any web page, so the fetch
+     fails, the client finds no usable account and refuses to log in ("Wispcraft account is not
+     ready. Select or sign in to your account in Wisp Settings, then reconnect"). The answer is
+     already in PROFILE_CACHE from the sign-in, so hand that back instead of a dead request. The
+     session join (sessionserver.mojang.com/session/minecraft/join) needs the same treatment and
+     cannot be faked: Mojang has to record the session, or the server's hasJoined check fails. */
+  function installProfileFetch() {
+    if (typeof window.fetch !== "function" || window.fetch.__wispcraftProfile) return;
+    var nativeFetch = window.fetch.bind(window);
+    function patched(input, init) {
+      var url = typeof input === "string" ? input : (input && input.url) || "";
+      if (/sessionserver\.mojang\.com\/session\/minecraft\//i.test(url)) {
+        /* Mojang sends no CORS headers, so a page cannot make this POST at all - which is what
+           turned every online-mode join into "Could not reach Minecraft session authentication".
+           The bundle already owns an epoxy client that speaks HTTPS through the wisp relay, so the
+           request goes down that tunnel: relay-side, same origin for the server, and the access
+           token never touches a third-party proxy. */
+        var relayFetch = window.wispcraft && window.wispcraft.fetchViaRelay;
+        if (typeof relayFetch === "function") {
+          try { return relayFetch(url, init); } catch (e) {}
+        }
+      }
+      if (/api\.minecraftservices\.com\/minecraft\/profile/i.test(url)) {
+        var cached = null;
+        try { cached = localStorage.getItem(PROFILE_CACHE); } catch (e) {}
+        if (cached) {
+          try {
+            return Promise.resolve(new Response(cached, {
+              status: 200, headers: { "content-type": "application/json" }
+            }));
+          } catch (e) {}
+        }
+      }
+      return nativeFetch(input, init);
+    }
+    patched.__wispcraftProfile = true;
+    try { window.fetch = patched; } catch (e) {}
+  }
+  installProfileFetch();
 
   seedAuthstore();
   seedAccountSkin();
