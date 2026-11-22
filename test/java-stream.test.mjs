@@ -96,6 +96,8 @@ function makeCtx() {
     connect_tcp: async (addr) => {
       const n = ++ctx.connectSeq;
       log.push("connect_tcp:" + addr);
+      /* a relay that accepts the stream and then never answers: no timer, so the test leaves no handle */
+      if (ctx.dialHangs) return new Promise(() => {});
       await new Promise((r) => setTimeout(r, 20));
       if (ctx.failDial) throw new Error("Wisp destination host could not be reached (code 1006)");
       log.push("connect_done:" + n);
@@ -191,6 +193,38 @@ test("java stream: a ping is not probed, a join is, and a failed dial closes the
     check("the failure is noted for the player",
       ctx.notes.some((n) => /dial failed for geo.test.example:25565/.test(n) && /1006/.test(n)), ctx.notes.join(" | "));
     check("it did not reach the post-connect wiring", !ctx.log.some((l) => l === "leave" && false), "");
+  }
+
+  /* a relay that accepts the stream and then never answers must not leave the socket open forever */
+  {
+    const ctx = makeCtx();
+    ctx.dialHangs = true;
+    ctx.window.wispcraftDialTimeout = 120;      /* the launcher override, so the test is quick */
+    const events = [];
+    const ws = new ctx.__VI("java://java://geo.test.example:25565");
+    ["open", "error", "close"].forEach((t) => ws.addEventListener(t, () => events.push(t)));
+    ws.start();
+    ws.send(new Uint8Array([6, 0, 4, 9, 1, 2, 3]).buffer);
+    await sleep(400);
+    check("a dial that never settles times out into error then close",
+      events.join(",") === "open,error,close", events.join(",") || "no events");
+    check("the timed-out socket ends closed", ws.readyState === 3, String(ws.readyState));
+    check("the note names the bound",
+      ctx.notes.some((n) => /dial failed for geo.test.example:25565/.test(n) && /within 120 ms/.test(n)), ctx.notes.join(" | "));
+    check("the connect gate was released on timeout", ctx.connects === 0 && ctx.log.includes("leave"), ctx.log.join(" "));
+  }
+
+  /* a socket that never sends a frame is still bounded: it becomes a join, not an endless wait */
+  {
+    const ctx = makeCtx();
+    ctx.window.wispcraftFrameTimeout = 100;
+    const ws = openSocket(ctx);
+    await sleep(10);
+    await sleep(300);
+    check("the frame wait is bounded and falls through to the dial",
+      ctx.log.some((l) => l.startsWith("connect_tcp:")), ctx.log.join(" "));
+    check("the frameless socket is treated as a join", ctx.reach.length === 1, ctx.reach.join(" ") || "none");
+    check("and the socket stays open while the dial succeeds", ws.readyState === 1 && ctx.events.join(",") === "open", ctx.events.join(","));
   }
 
   /* the same when the launcher's probe itself throws */

@@ -200,9 +200,11 @@ test("relay failover: sequential sweep, a refused switch, and the join-only chec
 
     /* the java stream: open first, dial only once the first frame says ping or join */
     const fwd = js.indexOf("async forward(A,__onFail){");
-    const fwdBody = fwd < 0 ? "" : js.slice(fwd, fwd + 1800);
+    const fwdBody = fwd < 0 ? "" : js.slice(fwd, fwd + 2600);
     check("the java stream dispatches open before it dials", /async forward\(A,__onFail\)\{var __open=A;queueMicrotask\(/.test(js), "");
     check("open is delivered asynchronously, like a real socket", /queueMicrotask\(function\(\)\{try\{__open\(\)/.test(js), "");
+    check("the dial is bounded by a timeout", /wispcraftDialTimeout/.test(fwdBody) && /Promise.race/.test(fwdBody), "");
+    check("the frame wait is bounded too", /wispcraftFrameTimeout/.test(fwdBody), "");
     check("a failed dial is reported to the socket, not swallowed",
       /if\(!__g\)\{/.test(fwdBody) && /__onFail&&__onFail\(__bad\)/.test(fwdBody) && /__bad=e/.test(fwdBody), "");
     const failAt = js.indexOf("__fail(){");

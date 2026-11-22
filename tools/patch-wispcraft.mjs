@@ -441,16 +441,24 @@ if (js.includes(DIAL_INTENT_MARKER) && js.includes(DIAL_FAIL_MARKER)) {
     "/* __wispDialIntent: wait for the client's first frame before dialing */" +
     "var __self=this,__h=I?I.hostname:this.url.hostname," +
     '__p=parseInt((I?I.port:this.url.port)||"25565",10)||25565,' +
-    "__t=I?I.host:this.url.host;" +
+    "__t=I?I.host:this.url.host,__fm=parseInt(window.wispcraftFrameTimeout,10)||4000;" +
     "if(void 0===__self.__frame){await new Promise(function(r){var d=0;" +
     '__self.__decide=function(v){if(d)return;d=1,r(v)};' +
-    'setTimeout(function(){if(!d){d=1,r("data")}},4000)})}' +
+    /* bounded: a socket that never sends a frame is treated as a join and dialled, rather than waiting
+       forever for a first packet that is not coming */
+    'setTimeout(function(){if(!d){d=1,r("data")}},__fm)})}' +
     'if(__self.__frame!=="motd"&&window.wispcraftEnsureRelayReaches&&__h){' +
     "try{await window.wispcraftEnsureRelayReaches(__h,__p)}catch(e){}}" +
     "var __ns=window.wispcraft,__g,__bad;" +
     "if(__ns&&__ns.__enterConnect)await __ns.__enterConnect();" +
-    "try{__g=await async function(x){return await SA,await KA.connect_tcp(x)}(__t)}catch(e){__bad=e}" +
-    "finally{if(__ns&&__ns.__leaveConnect)__ns.__leaveConnect()}" +
+    /* a relay can accept the stream and then never answer, and its connect_tcp never settles: without a
+       bound the socket would sit open forever. window.wispcraftDialTimeout overrides the 15 s. */
+    "var __ms=parseInt(window.wispcraftDialTimeout,10)||15000,__timer," +
+    "__dial=(async function(x){return await SA,await KA.connect_tcp(x)})(__t);" +
+    "__dial.catch(function(){});" +
+    "try{__g=await Promise.race([__dial,new Promise(function(_,rej){__timer=setTimeout(function(){" +
+    "rej(new Error(\"the relay did not connect within \"+__ms+\" ms\"))},__ms)})])}catch(e){__bad=e}" +
+    "finally{clearTimeout(__timer),__ns&&__ns.__leaveConnect&&__ns.__leaveConnect()}" +
     /* a failed dial is reported to the socket: it has already dispatched open, so staying quiet
        would leave the join on a socket that looks connected and never answers */
     "if(!__g){" +

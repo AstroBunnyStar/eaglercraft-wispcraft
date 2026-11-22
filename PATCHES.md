@@ -449,7 +449,12 @@ Three things had to change for that check to be worth anything:
    waiting on a socket that looks connected and never answers. `forward()` now catches the failed
    `connect_tcp`, notes the address and the relay's reason, and calls back into the socket, which
    aborts its outbound stream and dispatches `error` then `close` - the same ending a real socket
-   gives for a refused connection. (For the same reason the open callback has to run *before* the
+   gives for a refused connection.
+   Both waits are now bounded. The first-frame wait is 4 s (`window.wispcraftFrameTimeout`) and
+   treats a socket that never sends as a join. The dial races a 15 s timer
+   (`window.wispcraftDialTimeout`): a relay that accepts the stream and then never answers leaves
+   `connect_tcp` pending forever - measured live, a stream to a closed loopback port was still at
+   `open` after 25 s - so a timed-out dial takes the same `error` then `close` path. (For the same reason the open callback has to run *before* the
    `try` that resolves SRV: that block declares `const A = await LA(...)`, so calling `A()` inside it
    throws into the SRV catch and the event would never fire at all.)
    The page does not probe at boot either: the earlier version probed the first repaired entry on
