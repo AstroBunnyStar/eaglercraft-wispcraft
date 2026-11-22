@@ -457,6 +457,17 @@ Three things had to change for that check to be worth anything:
    `open` after 25 s - so a timed-out dial takes the same `error` then `close` path. (For the same reason the open callback has to run *before* the
    `try` that resolves SRV: that block declares `const A = await LA(...)`, so calling `A()` inside it
    throws into the SRV catch and the event would never fire at all.)
+   A dial that succeeds is still not a connection. `connect_tcp` only says the relay took the
+   stream; the target is dialled behind it, so a server that refuses or drops that stream fails
+   *after* `open` has been dispatched. The bundle wired the connected stream into two detached
+   `for(;;)` loops and dropped both promises, so that failure arrived as an unhandled rejection
+   while the socket stayed at `open` - the join waited forever with no error and no close. Patch 10
+   routes the failure where the dial failure goes: a stream that rejects *or ends*, the
+   connected-stream setup throwing, and the socket's own outbound read loop throwing all note the
+   reason and end the socket with `error` then `close` (a close that has already happened is not
+   repeated). Both view loops had to be covered, because the relay's side of the stream and the
+   client's own side fail independently. `test/java-stream.test.mjs` drives all four paths on the
+   shipped classes and also asserts that none of them leaves an unhandled rejection behind.
    The page does not probe at boot either: the earlier version probed the first repaired entry on
    every visit (its `pairs` reference was undefined, so it threw into the repair catch) and its
    fallback opened eight sockets at third-party relays in parallel.

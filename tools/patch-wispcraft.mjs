@@ -18,6 +18,8 @@
  *   6. Server entry - appends the launcher's java:// entry to the list the client builds at boot.
  *   8. Runtime relay switch - rebuilds the client on a new relay, gated on connects that are still opening.
  *   9. Join-only reach check - asks the launcher whether the relay can reach this server, and only for a join.
+ *  10. Post-connect failure - a stream that errors or ends after connect_tcp ends the socket with
+ *      error then close, instead of an unhandled rejection on a socket that stays open.
  * 7 before 4/5/6 because it rewrites the line patch 3 leaves behind; the numbers otherwise follow
  * the order they were added to the launcher, not the order they run.
  *
@@ -469,6 +471,55 @@ if (js.includes(DIAL_INTENT_MARKER) && js.includes(DIAL_FAIL_MARKER)) {
   js = js.replace(DIAL_ANCHOR, dial);
   changed++;
   lines.push("[fix]  java stream asks for the reach check only for a join, and dials behind the connect gate");
+}
+
+// ---------------------------------------------------------------- patch 10: a failure after the dial still ends the socket
+// connect_tcp is only the relay's answer. The target is dialled behind it, so a server that refuses
+// or drops the stream fails *after* the socket has already dispatched open. The bundle wires the
+// connected stream into two detached `for(;;)` loops and drops both promises on the floor, so that
+// failure arrives as an unhandled rejection while the socket sits at open forever - measured live,
+// a join through a relay that accepted the stream left Multiplayer waiting with no error and no
+// close. This depends on patch 9: `__onFail` (the forward() failure callback) and `__fail()` (the
+// error-then-close path on the socket) are what the loops report into.
+const STREAM_MARKER = "java stream failed after connect";
+const WIRE_ANCHOR = "const C=WA(g.write.getWriter(),A=>A.inner);this.rawEpoxy=C.getWriter();";
+const READ_LOOP_END = "if(g||!C)return;await B.epoxyRead(C),A--}})()";
+const SEND_LOOP_END = "if(g||!C)return;await B.eaglerRead(C),A--}})()";
+const IMPL_TAIL_ANCHOR = ",this.impl=B,this.__wantPing&&(this.__wantPing=0,this.ping())}ping(){";
+const OUT_LOOP_ANCHOR =
+  'this.readyState=WebSocket.CLOSING,this.dispatchEvent(new Event("close")),this.readyState=WebSocket.CLOSED}' +
+  'catch(A){console.error(A),this.dispatchEvent(new Event("error"))}})()}';
+
+const streamAnchors = [WIRE_ANCHOR, READ_LOOP_END, SEND_LOOP_END, IMPL_TAIL_ANCHOR, OUT_LOOP_ANCHOR];
+if (js.includes(STREAM_MARKER)) {
+  lines.push("[ok]   post-connect failure patch already present");
+} else if (!js.includes("__fail(){") || !streamAnchors.every((a) => js.split(a).length - 1 === 1)) {
+  lines.push("[skip] post-connect failure: the socket or the stream wiring anchor was not found once");
+} else {
+  /* one reporter for everything that can go wrong after the dial: the note names the reason for the
+     player, and the socket's own failure callback does the error then close */
+  const failSrc =
+    "var __sf=function(e){window.wispcraftNote&&window.wispcraftNote(\"java stream failed after connect: \"+" +
+    "String((e&&(e.message||e))||\"stream error\"));__onFail&&__onFail(e)};try{";
+  js = js.replace(WIRE_ANCHOR, failSrc + WIRE_ANCHOR);
+  /* a stream that ends is as dead as one that throws: both would otherwise leave an open, silent
+     socket behind, and the normal close path is already guarded by __fail()'s readyState check */
+  js = js.replace(READ_LOOP_END, "if(g||!C)return void __sf();await B.epoxyRead(C),A--}})().catch(__sf)");
+  js = js.replace(SEND_LOOP_END, "if(g||!C)return void __sf();await B.eaglerRead(C),A--}})().catch(__sf)");
+  js = js.replace(
+    IMPL_TAIL_ANCHOR,
+    ",this.impl=B,this.__wantPing&&(this.__wantPing=0,this.ping())}catch(__e){__sf(__e)}}ping(){"
+  );
+  /* the socket's own outbound loop had the same hole: a read that threw dispatched error and left
+     readyState at OPEN, and a second close after __fail() would fire twice */
+  js = js.replace(
+    OUT_LOOP_ANCHOR,
+    'this.readyState!==WebSocket.CLOSED&&(this.readyState=WebSocket.CLOSING,' +
+      'this.dispatchEvent(new Event("close")),this.readyState=WebSocket.CLOSED)}' +
+      "catch(A){console.error(A),this.__fail()}})()}"
+  );
+  changed++;
+  lines.push("[fix]  post-connect stream failures end the socket with error then close");
 }
 
 // ---------------------------------------------------------------- validate before writing

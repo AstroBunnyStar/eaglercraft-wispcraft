@@ -8,7 +8,10 @@
  *   5. once the connects drain, the same switch rebuilds the client;
  *   6. a connect that arrives during a switch is held, then released;
  *   7. open reaches a listener that attaches after the constructor, and a failed dial ends in
- *      error then close rather than a socket that looks connected forever.
+ *      error then close rather than a socket that looks connected forever;
+ *   8. a stream that fails or ends *after* a successful dial - the relay accepted the stream but the
+ *      target refused or dropped it - ends the socket the same way, as does the connected-stream
+ *      setup throwing and the socket's own outbound read loop throwing.
  *
  * The classes and the gate block are cut out of the shipped wispcraft.js, so this drives the code the
  * browser runs rather than a copy of it. Run with: node --test
@@ -54,9 +57,12 @@ function makeCtx() {
     reach: [],
     connects: 0,
     connectSeq: 0,
-    /* a minimal stand-in for the two stream pairs WI builds */
+    /* a minimal stand-in for the two stream pairs WI builds; the first pair feeds the socket's own
+       outbound loop, which is another place a post-connect failure can surface */
     tI: () => [
-      { getReader: () => NEVER },
+      ctx.outReadFails
+        ? { getReader: () => ({ read: () => Promise.reject(new Error("eaglerOut read failed")), getReader() { return this; } }) }
+        : { getReader: () => NEVER },
       { getWriter: () => ({ write: () => Promise.resolve(), abort() {}, close: () => Promise.resolve() }) },
     ],
     tA: class {
@@ -65,6 +71,8 @@ function makeCtx() {
     },
     dI: class {
       constructor() {
+        /* the real one reads epoxyclientoptions; if it throws, forward() would reject silently */
+        if (ctx.implThrows) throw new TypeError("Cannot read properties of undefined (reading 'epoxyclientoptions_new_default')");
         this.compressor = { transform: async (v) => v };
         this.decompressor = { transform: async (v) => v };
         this.decryptor = { transform: new TransformStream() };
@@ -101,9 +109,17 @@ function makeCtx() {
       await new Promise((r) => setTimeout(r, 20));
       if (ctx.failDial) throw new Error("Wisp destination host could not be reached (code 1006)");
       log.push("connect_done:" + n);
+      /* the relay accepted the stream; what happens behind it decides whether the join lives */
+      /* the bundle calls getReader(), wraps the reader, then calls getReader() again on the result */
+      const reader = (read) => ({ read, getReader() { return this; } });
+      const leaf = ctx.streamFails
+        ? { getReader: () => reader(() => Promise.reject(new Error("stream reset by relay (code 1006)"))) }
+        : ctx.streamEnds
+          ? { getReader: () => reader(() => Promise.resolve({ done: true })) }
+          : NEVER;
       return {
         write: { getWriter: () => ({ write: () => Promise.resolve() }) },
-        read: { pipeThrough: () => ({ pipeThrough: () => ({ pipeThrough: () => ({ pipeThrough: () => NEVER }) }) }) },
+        read: { pipeThrough: () => ({ pipeThrough: () => ({ pipeThrough: () => ({ pipeThrough: () => leaf }) }) }) },
       };
     },
   };
@@ -240,6 +256,40 @@ test("java stream: a ping is not probed, a join is, and a failed dial closes the
     await sleep(300);
     check("a throwing reach check still dials, and a failed dial still closes the socket",
       events.join(",") === "open,error,close", events.join(",") || "no events");
+  }
+
+  /* a dial that succeeds is not a connection: the target is dialled behind it, and a refusal or a
+     drop arrives on the stream after open. Each of these used to end as an unhandled rejection on a
+     socket that stayed at open with no error and no close. */
+  for (const [name, setup, why] of [
+    ["a stream that errors after a successful dial", (c) => { c.streamFails = true; }, /stream reset by relay/],
+    ["a stream that ends after a successful dial", (c) => { c.streamEnds = true; }, /stream error/],
+    ["the connected-stream setup throwing", (c) => { c.implThrows = true; }, /epoxyclientoptions_new_default/],
+    ["the socket's own outbound read throwing", (c) => { c.outReadFails = true; }, /eaglerOut read failed/],
+  ]) {
+    const ctx = makeCtx();
+    setup(ctx);
+    const events = [];
+    const unhandled = [];
+    const onUnhandled = (e) => unhandled.push(String((e && e.message) || e));
+    let ws;
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      ws = new ctx.__VI("java://java://geo.test.example:25565");
+      ["open", "error", "close"].forEach((t) => ws.addEventListener(t, () => events.push(t)));
+      ws.start();
+      ws.send(new Uint8Array([6, 0, 4, 9, 1, 2, 3]).buffer);
+      await sleep(300);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    check(`${name} ends the socket with error then close`,
+      events.join(",") === "open,error,close", events.join(",") || "no events");
+    check(`${name} leaves the socket closed`, ws.readyState === 3, String(ws.readyState));
+    check(`${name} is reported to the player`,
+      ctx.notes.some((n) => /java stream failed after connect/.test(n) && why.test(n)), ctx.notes.join(" | ") || "no notes");
+    check(`${name} leaves no unhandled rejection`, unhandled.length === 0, unhandled.join(" | "));
+    check(`${name} releases the connect gate`, ctx.connects === 0 && ctx.log.includes("leave"), ctx.log.join(" "));
   }
 
   /* 4.-6. the switch gate, running patch 8's own code */
