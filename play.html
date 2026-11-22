@@ -349,7 +349,11 @@
   function srvCached(host) {
     try {
       var all = JSON.parse(localStorage.getItem(SRV_CACHE) || "{}"), hit = all[host];
-      if (hit && typeof hit.at === "number" && Date.now() - hit.at < SRV_TTL) return hit.target;
+      if (hit && typeof hit.at === "number" && Date.now() - hit.at < SRV_TTL) {
+        /* "there is no SRV record" is an answer and is kept for the TTL as well: without this every
+           visit re-asked for every host in the saved list that has none, and the saved list grows */
+        return typeof hit.target === "string" && hit.target ? hit.target : null;
+      }
     } catch (e) {}
     return undefined;
   }
@@ -367,7 +371,7 @@
   }
   function resolveSrv(host) {
     var cached = srvCached(host);
-    if (cached !== undefined) return Promise.resolve(cached);
+    if (cached !== undefined) return Promise.resolve(cached === null ? undefined : cached);
     var name = encodeURIComponent("_minecraft._tcp." + host);
     var endpoints = [
       "https://cloudflare-dns.com/dns-query?name=" + name + "&type=SRV",
@@ -392,6 +396,154 @@
   }
   /* reachable from the console and the tools, so an SRV answer can be checked without a joystick */
   window.wispcraftResolveSrv = resolveSrv;
+  /* index.html probes relays against example.com and Microsoft, so a relay can pass its launch test
+     and still be unable to reach the game server - which the client reports as "Wisp destination
+     host could not be reached (code 1006)". Reachability therefore has to be decided per target:
+     this opens a real Wisp stream to the server's own address and sends a status handshake, which
+     every Java server answers, so silence means the relay could not get there. When the relay in
+     use cannot reach the server, another relay that can is picked and stored, which is the key the
+     bundle reads for the relay it dials. Packet layout matches index.html:
+     [type][streamID u32 LE][body], CONNECT 0x01 with [streamType][port u16 LE][hostname],
+     CONTINUE 0x03, DATA 0x02, CLOSE 0x04. */
+  var RELAY_KEY = "wispcraft_wispurl", REACH_CACHE = "wispcraft_relay_reach", REACH_TTL = 10 * 60 * 1000;
+
+  function relayInUse() {
+    try {
+      var saved = localStorage.getItem(RELAY_KEY);
+      if (saved) return saved;
+    } catch (e) {}
+    return "wss://truffled.lol/wisp/";
+  }
+  function relayHost(url) {
+    try { return new URL(url).host; } catch (e) { return String(url); }
+  }
+  /* status handshake: protocol 47, next state 1, then a status request - a server answers the
+     response even when the client's version is not the one it speaks */
+  function statusHandshake(host, port) {
+    function varint(n) {
+      var out = [];
+      do { var b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n);
+      return out;
+    }
+    var name = [];
+    for (var i = 0; i < host.length; i++) name.push(host.charCodeAt(i) & 0xff);
+    var handshake = [0x00].concat(varint(47), varint(name.length), name, [(port >> 8) & 255, port & 255, 1]);
+    return varint(handshake.length).concat(handshake, [0x01, 0x00]);
+  }
+  function probeTarget(relayUrl, host, port, timeout) {
+    return new Promise(function (finish) {
+      var started = Date.now(), done = false, ws = null, timer = null;
+      function end(ok, why) {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        try { if (ws && ws.readyState === 1) ws.close(); } catch (e) {}
+        finish({ relay: relayUrl, ok: ok, ms: Date.now() - started, why: why || "" });
+      }
+      try { ws = new WebSocket(relayUrl); } catch (e) { return end(false, "socket"); }
+      ws.binaryType = "arraybuffer";
+      timer = setTimeout(function () { end(false, "no answer"); }, timeout || 4000);
+      ws.onopen = function () {
+        try {
+          var name = new Uint8Array(host.length);
+          for (var i = 0; i < host.length; i++) name[i] = host.charCodeAt(i) & 0xff;
+          var connect = new Uint8Array(8 + name.length);
+          connect[0] = 0x01; connect[1] = 1;              /* CONNECT on stream 1 */
+          connect[5] = 0x01;                              /* stream type: TCP */
+          connect[6] = port & 255; connect[7] = (port >> 8) & 255;
+          connect.set(name, 8);
+          var request = statusHandshake(host, port);
+          var data = new Uint8Array(5 + request.length);
+          data[0] = 0x02; data[1] = 1;
+          for (var k = 0; k < request.length; k++) data[5 + k] = request[k];
+          /* queued straight after CONNECT: several relays never send the CONTINUE a client would
+             otherwise wait for, and waiting on it marked healthy relays as unreachable */
+          ws.send(connect);
+          ws.send(data);
+        } catch (e) { end(false, "send"); }
+      };
+      ws.onmessage = function (ev) {
+        var d = new Uint8Array(ev.data);
+        if (!d.length) return;
+        if (d[0] === 0x04) return end(false, "relay refused");   /* CLOSE */
+        if (d[0] === 0x02 && d.length > 5) return end(true, "answered");  /* DATA from the server */
+      };
+      ws.onerror = function () { end(false, "relay unreachable"); };
+      ws.onclose = function () { end(false, "closed"); };
+    });
+  }
+  /* the relay list lives in index.html; reading it there keeps one list instead of two copies */
+  function relayList() {
+    if (window.wispcraftRelayList) return Promise.resolve(window.wispcraftRelayList);
+    return fetch("index.html", { cache: "no-store" }).then(function (r) { return r.text(); }).then(function (text) {
+      var out = [], re = /"(wss:\/\/[^"]+)"/g, m;
+      while ((m = re.exec(text))) {
+        if (out.indexOf(m[1]) < 0) out.push(m[1]);
+      }
+      window.wispcraftRelayList = out;
+      return out;
+    }).catch(function () { return []; });
+  }
+  function reachCached(key) {
+    try {
+      var all = JSON.parse(localStorage.getItem(REACH_CACHE) || "{}"), hit = all[key];
+      if (hit && typeof hit.at === "number" && Date.now() - hit.at < REACH_TTL) return hit;
+    } catch (e) {}
+    return null;
+  }
+  function reachRemember(key, relay, ok) {
+    try {
+      var all = JSON.parse(localStorage.getItem(REACH_CACHE) || "{}");
+      all[key] = { at: Date.now(), relay: relay, ok: !!ok };
+      localStorage.setItem(REACH_CACHE, JSON.stringify(all));
+    } catch (e) {}
+  }
+  function useRelay(url) {
+    try { localStorage.setItem(RELAY_KEY, url); } catch (e) {}
+  }
+  /* Resolves {relay, ok, switched}. One probe of the relay in use; only if that fails is the list
+     swept, and the fastest relay that reaches the server wins, so a blocked relay costs one probe
+     rather than the whole list. */
+  function ensureRelayReaches(host, port, opt) {
+    host = String(host || "").split(":")[0];
+    port = parseInt(port, 10) || 25565;
+    if (!host) return Promise.resolve(null);
+    var key = host + ":" + port, quiet = opt && opt.quiet;
+    var cached = reachCached(key);
+    if (cached && cached.ok && cached.relay === relayInUse()) return Promise.resolve(cached);
+    if (cached && !cached.ok && cached.relay === relayInUse()) return Promise.resolve(cached);
+    var mine = relayInUse();
+    return probeTarget(mine, host, port).then(function (res) {
+      if (res.ok) {
+        reachRemember(key, mine, true);
+        return res;
+      }
+      return relayList().then(function (all) {
+        var others = all.filter(function (u) { return u !== mine; });
+        /* keep this to a handful of sockets: the list has more than twenty entries, but a relay that
+           carries the session in index.html's probe is the plausible candidate */
+        var tried = others.slice(0, 8);
+        if (!tried.length) return res;
+        return Promise.all(tried.map(function (u) { return probeTarget(u, host, port, 4000); })).then(function (results) {
+          var good = results.filter(function (r) { return r.ok; }).sort(function (a, b) { return a.ms - b.ms; })[0];
+          if (!good) {
+            reachRemember(key, mine, false);
+            if (!quiet) {
+              window.wispcraftNote("no relay could reach " + key + " - the server may be down, or its shield may refuse relay traffic");
+            }
+            return res;
+          }
+          useRelay(good.relay);
+          reachRemember(key, good.relay, true);
+          if (!quiet) {
+            window.wispcraftNote("relay " + relayHost(mine) + " could not reach " + key + ", switched to " + relayHost(good.relay));
+          }
+          return { relay: good.relay, ok: true, ms: good.ms, switched: true, from: mine };
+        });
+      });
+    }).catch(function () { return null; });
+  }
+  window.wispcraftEnsureRelayReaches = ensureRelayReaches;
   /* Quick Play (play.html?server=<host>) hands the host to the client as a plain address, and the
      client dials it as wss://<host> - an EaglerX socket, which no Java server answers, so the join
      dies with "connection dropped without a WebSocket close frame (code 1006)". Wisp mode is the
@@ -459,6 +611,11 @@
       installJavaEntry(parts[0], port, target.request);
       window.wispcraftNote(target.request + " is in your server list in Wisp mode (java://" + parts[0] +
         ":" + port + ") - press Multiplayer, select it and Join Server.");
+      /* online-mode joining is a Mojang session request, and the relay is what makes it reachable from
+         a browser - which means the relay carries the account's session token. Say so where the join
+         is offered, and point at the setting that changes it. */
+      window.wispcraftNote("this join is tunnelled through the Wisp relay (" + relayHost(relayInUse()) +
+        "), which carries your Microsoft session token for the login handshake; Wisp Settings -> Wisp Server chooses another relay");
     }).catch(function () {});
     return target;
   }
@@ -636,10 +793,21 @@
         var touched = [], bytes = saved.bytes;
         for (var i = 0; i < resolved.length; i++) {
           if (!resolved[i].target) continue;
-          var target = String(resolved[i].target).split(":")[0];
+          var parts = String(resolved[i].target).split(":");
+          var target = parts[0];
+          var targetPort = parseInt(parts[1] || "25565", 10) || 25565;
           if (!target || target === resolved[i].host) continue;
-          var next = replaceLengthPrefixedHost(bytes, resolved[i].host, target);
-          if (next !== bytes) { touched.push(resolved[i].host + " -> " + target); bytes = next; }
+          var next = bytes;
+          /* an entry usually spells the default port out, so on a non-default SRV port the host and
+             the port have to move together or the repair writes a host that listens elsewhere */
+          if (targetPort !== 25565) {
+            next = replaceLengthPrefixedHost(bytes, resolved[i].host + ":25565", target + ":" + targetPort);
+          }
+          if (next === bytes) next = replaceLengthPrefixedHost(bytes, resolved[i].host, target);
+          if (next !== bytes) {
+            touched.push(resolved[i].host + " -> " + target + (targetPort !== 25565 ? ":" + targetPort : ""));
+            bytes = next;
+          }
         }
         if (!touched.length) return 0;
         var buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length);
@@ -650,7 +818,16 @@
             finish(touched.length);
           };
           put.onerror = function () { finish(0); };
-        }).then(function (written) { return written || touched.length; });
+        }).then(function (written) {
+          /* the entry now names an endpoint: check the relay can actually dial it, and move to one
+             that can if this one cannot (the client's own error for that is a bare code 1006) */
+          for (var i = 0; i < pairs.length; i++) {
+            var p = String(pairs[i].target).split(":");
+            ensureRelayReaches(p[0], parseInt(p[1] || "25565", 10) || 25565);
+            break;
+          }
+          return written || touched.length;
+        });
       });
     }).catch(function () { return 0; });
   }
@@ -709,6 +886,15 @@
       if (/api\.minecraftservices\.com\/minecraft\/profile/i.test(url)) {
         var cached = null;
         try { cached = localStorage.getItem(PROFILE_CACHE); } catch (e) {}
+        /* the cache belongs to one account: a different account signed in since must not be handed
+           the previous one's name and skin */
+        if (cached) {
+          var me = lastAccount();
+          try {
+            var who = JSON.parse(cached);
+            if (me && me.username && who && who.name && who.name !== me.username) cached = null;
+          } catch (e) { cached = null; }
+        }
         if (cached) {
           try {
             return Promise.resolve(new Response(cached, {
