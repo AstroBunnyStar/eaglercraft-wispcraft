@@ -543,62 +543,114 @@
     }
     return bytes;
   }
+  /* Hosts worth resolving in a saved list: maximal runs of lowercase host characters that contain a
+     dot, skipping the tail of a ws:// or wss:// address. Names, modes and base64 icons cannot match,
+     and a run is taken whole, so "geo.minemen.club:25565" yields the host alone. */
+  function hostsInSavedList(bytes) {
+    var found = [], run = "", start = 0, i;
+    function keep() {
+      var last = run.charAt(run.length - 1), first = run.charAt(0);
+      if (run.length >= 4 && run.length <= 253 && run.indexOf(".") > 0 && last !== "." && last !== "-" &&
+          first !== "." && first !== "-" &&
+          !(start >= 3 && bytes[start - 1] === 47 && bytes[start - 2] === 47 && bytes[start - 3] === 58)) {
+        if (found.indexOf(run) < 0) found.push(run);
+      }
+      run = "";
+    }
+    for (i = 0; i < bytes.length; i++) {
+      var b = bytes[i];
+      if ((b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b === 46 || b === 45) {
+        if (!run.length) start = i;
+        run += String.fromCharCode(b);
+      } else keep();
+    }
+    keep();
+    return found;
+  }
+  /* The client keeps its server list in servers.dat inside its own filesystem database, and it hands
+     an entry's address to the relay verbatim - so a saved "minemen.club" keeps timing out while the
+     server only listens on geo.minemen.club:25565, and the client's own list wins over the entry the
+     launcher supplies. Server addresses are NBT strings, i.e. a 2-byte length prefix followed by the
+     host, so a host that already has an SRV target is rewritten where it sits: the length prefix is
+     part of the match, which keeps the edit off every other string in the file. Every visit runs this,
+     plain or ?server=, and the hosts come from the saved list itself so an entry the player typed is
+     repaired too, not just the one this launcher page was opened with. */
   function repairSavedServers() {
     if (!window.indexedDB) return Promise.resolve(0);
-    /* only hosts the launcher has already resolved: the armed entry and anything in the SRV cache */
-    var candidates = [], cache = {};
-    try { cache = JSON.parse(localStorage.getItem(SRV_CACHE) || "{}"); } catch (e) { cache = {}; }
-    for (var host in cache) {
-      if (Object.prototype.hasOwnProperty.call(cache, host) && typeof cache[host].target === "string") candidates.push(host);
-    }
-    var armed = window.wispcraftJavaQuickPlay;
-    if (armed && armed.request && candidates.indexOf(armed.request) < 0) candidates.push(armed.request);
-    if (!candidates.length) return Promise.resolve(0);
-    return Promise.all(candidates.map(function (h) {
-      return resolveSrv(h).then(function (t) { return { host: h, target: t }; }).catch(function () { return { host: h, target: undefined }; });
-    })).then(function (resolved) {
-      var pairs = resolved.filter(function (r) { return r.target; });
-      if (!pairs.length) return 0;
-      var DB = "_net_lax1dude_eaglercraft_v1_8_internal_PlatformFilesystem_1_8_8_worlds";
+    var DB = "_net_lax1dude_eaglercraft_v1_8_internal_PlatformFilesystem_1_8_8_worlds";
+    function withStore(mode, work) {
       return new Promise(function (done) {
         var open = indexedDB.open(DB);
-        open.onerror = function () { done(0); };
+        open.onerror = function () { done(null); };
         open.onsuccess = function () {
           var db = open.result;
           try {
-            var store = db.transaction("filesystem", "readwrite").objectStore("filesystem");
-            var cursor = store.openCursor();
-            var record = null;
-            cursor.onerror = function () { db.close(); done(0); };
-            cursor.onsuccess = function (e) {
-              var c = e.target.result;
-              if (c) {
-                if (String(c.key) === "servers.dat") record = c.value;
-                c.continue();
-                return;
-              }
-              if (!record) { db.close(); return done(0); }
-              var data = record.data;
-              var bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data);
-              var original = bytes, touched = [];
-              for (var i = 0; i < pairs.length; i++) {
-                var target = String(pairs[i].target).split(":")[0];
-                if (target === pairs[i].host) continue;
-                var next = replaceLengthPrefixedHost(bytes, pairs[i].host, target);
-                if (next !== bytes) { touched.push(pairs[i].host + " -> " + target); bytes = next; }
-              }
-              if (!touched.length) { db.close(); return done(0); }
-              var buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length);
-              var put = store.put({ path: record.path, data: buffer });
-              put.onsuccess = function () {
-                window.wispcraftNote("server list repaired: " + touched.join(", "));
-                db.close();
-                done(touched.length);
-              };
-              put.onerror = function () { db.close(); done(0); };
-            };
-          } catch (err) { try { db.close(); } catch (e) {} done(0); }
+            work(db, db.transaction("filesystem", mode).objectStore("filesystem"), function (value) {
+              try { db.close(); } catch (e) {}
+              done(value);
+            });
+          } catch (err) {
+            try { db.close(); } catch (e) {}
+            done(null);
+          }
         };
+      });
+    }
+    /* read first, resolve after: a transaction does not survive an await */
+    return withStore("readonly", function (db, store, finish) {
+      var cursor = store.openCursor(), record = null;
+      cursor.onerror = function () { finish(null); };
+      cursor.onsuccess = function (e) {
+        var c = e.target.result;
+        if (c) {
+          if (String(c.key) === "servers.dat") record = c.value;
+          c.continue();
+          return;
+        }
+        if (!record) return finish(null);
+        var data = record.data;
+        var bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data);
+        finish({ path: record.path, bytes: bytes });
+      };
+    }).then(function (saved) {
+      if (!saved) return 0;
+      var hosts = [];
+      function add(host) {
+        if (!host) return;
+        host = String(host).split(":")[0].toLowerCase();
+        if (host && host.indexOf(".") > 0 && hosts.indexOf(host) < 0) hosts.push(host);
+      }
+      hostsInSavedList(saved.bytes).forEach(add);
+      var armed = window.wispcraftJavaQuickPlay;
+      if (armed && armed.request) add(armed.request);
+      var cache = {};
+      try { cache = JSON.parse(localStorage.getItem(SRV_CACHE) || "{}"); } catch (e) { cache = {}; }
+      for (var host in cache) {
+        if (Object.prototype.hasOwnProperty.call(cache, host)) add(host);
+      }
+      hosts = hosts.slice(0, 12);
+      if (!hosts.length) return 0;
+      return Promise.all(hosts.map(function (h) {
+        return resolveSrv(h).then(function (t) { return { host: h, target: t }; }).catch(function () { return { host: h, target: undefined }; });
+      })).then(function (resolved) {
+        var touched = [], bytes = saved.bytes;
+        for (var i = 0; i < resolved.length; i++) {
+          if (!resolved[i].target) continue;
+          var target = String(resolved[i].target).split(":")[0];
+          if (!target || target === resolved[i].host) continue;
+          var next = replaceLengthPrefixedHost(bytes, resolved[i].host, target);
+          if (next !== bytes) { touched.push(resolved[i].host + " -> " + target); bytes = next; }
+        }
+        if (!touched.length) return 0;
+        var buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length);
+        return withStore("readwrite", function (db, store, finish) {
+          var put = store.put({ path: saved.path, data: buffer });
+          put.onsuccess = function () {
+            window.wispcraftNote("server list repaired: " + touched.join(", "));
+            finish(touched.length);
+          };
+          put.onerror = function () { finish(0); };
+        }).then(function (written) { return written || touched.length; });
       });
     }).catch(function () { return 0; });
   }
@@ -624,9 +676,12 @@
          a direct-connection hint, and two notes racing would leave whichever resolved last on screen */
       if (!target) addJavaServer(raw);
       dropQuickPlayParam();
-      repairSavedServers().catch(function () {});
     } catch (e) {}
   })();
+
+  /* A plain visit gets the same repair: someone who opens the page and then picks their saved Minemen
+     entry must find a host the relay can actually dial, exactly as ?server=minemen.club would. */
+  repairSavedServers().catch(function () {});
 
   /* Connecting needs the account object, and the client refreshes it with a plain fetch to
      api.minecraftservices.com/minecraft/profile - which CORS blocks for any web page, so the fetch
