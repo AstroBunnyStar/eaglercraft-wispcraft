@@ -443,6 +443,13 @@ Three things had to change for that check to be worth anything:
    reach check and any switch complete before the join's TCP stream is opened, and the dial itself is
    bracketed by the gate above, so a switch can neither rebuild mid-connect nor start while the
    join's own connection is being opened.
+   Because `open` is dispatched before the dial, a dial that fails would otherwise leave the join
+   waiting on a socket that looks connected and never answers. `forward()` now catches the failed
+   `connect_tcp`, notes the address and the relay's reason, and calls back into the socket, which
+   aborts its outbound stream and dispatches `error` then `close` - the same ending a real socket
+   gives for a refused connection. (For the same reason the open callback has to run *before* the
+   `try` that resolves SRV: that block declares `const A = await LA(...)`, so calling `A()` inside it
+   throws into the SRV catch and the event would never fire at all.)
    The page does not probe at boot either: the earlier version probed the first repaired entry on
    every visit (its `pairs` reference was undefined, so it threw into the repair catch) and its
    fallback opened eight sockets at third-party relays in parallel.

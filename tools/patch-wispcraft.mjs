@@ -378,6 +378,8 @@ if (js.includes(SWITCH_MARKER) && js.includes(GATE_MARKER)) {
 // is joining. The dial itself is deferred until then, so a switch still happens before the join's TCP
 // is opened, and it is bracketed by the connect gate patch 8 publishes.
 const DIAL_INTENT_MARKER = "__wispDialIntent";
+/* forward() runs before the dial now, so a dial that throws has to be able to reach the socket */
+const DIAL_FAIL_MARKER = "__onFail";
 const FWD_OPEN_ANCHOR = "async forward(A){let I;try{";
 /* the trailing A() is the original "connected" callback: open is dispatched before the dial now, so
    it is consumed by the replacement instead of firing twice */
@@ -385,18 +387,36 @@ const DIAL_ANCHOR = "const g=await async function(A){return await SA,await KA.co
 const SEND_ANCHOR = 'send(A){let I;if("string"!=typeof A){';
 const MOTD_ANCHOR = 'else"accept: motd"==A.toLowerCase()&&this.inner.ping()}';
 const IMPL_ANCHOR = "this.impl=B}ping(){";
+const START_ANCHOR = 'this.inner.forward(()=>{this.readyState=WebSocket.OPEN,this.dispatchEvent(new Event("open"))})';
+const CLOSE_ANCHOR = "close(){if(this.readyState!=WebSocket.CLOSING&&this.readyState!=WebSocket.CLOSED){";
 
-const dialAnchors = [FWD_OPEN_ANCHOR, DIAL_ANCHOR, SEND_ANCHOR, MOTD_ANCHOR, IMPL_ANCHOR];
+const dialAnchors = [FWD_OPEN_ANCHOR, DIAL_ANCHOR, SEND_ANCHOR, MOTD_ANCHOR, IMPL_ANCHOR, START_ANCHOR, CLOSE_ANCHOR];
 const dialAnchorOk = dialAnchors.every((a) => js.split(a).length - 1 === 1);
 
-if (js.includes(DIAL_INTENT_MARKER)) {
+if (js.includes(DIAL_INTENT_MARKER) && js.includes(DIAL_FAIL_MARKER)) {
   lines.push("[ok]   join-only reach check already present");
 } else if (!dialAnchorOk) {
   lines.push("[skip] join-only reach check: the java stream anchors were not all found once");
 } else {
   /* open first: the client identifies itself in its first frame, and a join buffers that handshake
-     until the connection below is established */
-  js = js.replace(FWD_OPEN_ANCHOR, FWD_OPEN_ANCHOR + "A();");
+     until the connection below is established. The second argument is the socket's failure callback,
+     which the original code never passed because open could not fail before the dial.
+     A() has to run *outside* the block below: that block declares `const A = await LA(...)`, so the
+     parameter is in its temporal dead zone inside it and calling A() there throws into the SRV
+     catch - the open event would never fire at all. */
+  js = js.replace(FWD_OPEN_ANCHOR, "async forward(A,__onFail){A();let I;try{");
+
+  /* VI.__fail(): open already fired, so a dial that never connects has to end in the events a real
+     socket would send - error, then close - or the join waits forever on an open, silent socket */
+  js = js.replace(
+    CLOSE_ANCHOR,
+    "__fail(){if(this.readyState===WebSocket.CLOSED||this.readyState===WebSocket.CLOSING)return;" +
+      "this.readyState=WebSocket.CLOSING;try{this.inner.eaglerIn.abort()}catch(e){}" +
+      'try{this.dispatchEvent(new Event("error"))}catch(e){}' +
+      'this.readyState=WebSocket.CLOSED;this.dispatchEvent(new Event("close"))}' +
+      CLOSE_ANCHOR
+  );
+  js = js.replace(START_ANCHOR, START_ANCHOR.slice(0, -1) + ",()=>this.__fail())");
 
   js = js.replace(
     SEND_ANCHOR,
@@ -419,10 +439,16 @@ if (js.includes(DIAL_INTENT_MARKER)) {
     'setTimeout(function(){if(!d){d=1,r("data")}},4000)})}' +
     'if(__self.__frame!=="motd"&&window.wispcraftEnsureRelayReaches&&__h){' +
     "try{await window.wispcraftEnsureRelayReaches(__h,__p)}catch(e){}}" +
-    "var __ns=window.wispcraft,__g;" +
+    "var __ns=window.wispcraft,__g,__bad;" +
     "if(__ns&&__ns.__enterConnect)await __ns.__enterConnect();" +
-    "try{__g=await async function(x){return await SA,await KA.connect_tcp(x)}(__t)}" +
+    "try{__g=await async function(x){return await SA,await KA.connect_tcp(x)}(__t)}catch(e){__bad=e}" +
     "finally{if(__ns&&__ns.__leaveConnect)__ns.__leaveConnect()}" +
+    /* a failed dial is reported to the socket: it has already dispatched open, so staying quiet
+       would leave the join on a socket that looks connected and never answers */
+    "if(!__g){" +
+    'var __why=String((__bad&&(__bad.message||__bad))||"did not connect");' +
+    "window.wispcraftNote&&window.wispcraftNote(\"relay dial failed for \"+__t+\": \"+__why);" +
+    "__onFail&&__onFail(__bad);return}" +
     "const g=__g;";
   js = js.replace(DIAL_ANCHOR, dial);
   changed++;
