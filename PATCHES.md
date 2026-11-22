@@ -436,7 +436,9 @@ Three things had to change for that check to be worth anything:
    alone.
 2. **Only the join is checked.** A ping and a join arrive as the same `java://` socket and are
    indistinguishable until the client's first frame: a status ping sends the string `accept: motd`,
-   a join sends its binary handshake. Patch 9 therefore dispatches `open` first, defers `connect_tcp`
+   a join sends its binary handshake. Patch 9 therefore dispatches `open` first (in a microtask: the
+   bundle's WebSocket proxy calls `start()` inside its constructor, so a synchronous dispatch would
+   reach nobody and the client would never send a frame), defers `connect_tcp`
    until that first frame has arrived, and awaits `window.wispcraftEnsureRelayReaches(host, port)`
    only for a join - for the address actually being dialed, after SRV. A ping dials the relay as it
    always did, with no probe and no switch. The deferred dial is what keeps the order right: the
@@ -466,9 +468,11 @@ traffic), the client's own `java://geo.minemen.club:25565` socket switched to
 `relay us-east.wisp.q13x.com could not reach geo.minemen.club:25565, switched to truffled.lol - the
 client dials truffled.lol`, `window.wispcraft.wispUrl` changed with it, and the relay socket opened on the
 replacement. That run exercised the switch and the wiring, not the new split: patch 9 now asks for the
-check only after a join's first frame, which `.tmp/reach-test.mjs` pins without a browser
+check only after a join's first frame, which `test/relay-failover.test.mjs` pins without a browser
 (one probe at a time, early stop, the switch call, the refused-switch path, the cache, and the bundle
-markers for the deferred dial, the join-only guard and the connect gate).
+markers for the deferred dial, the join-only guard and the connect gate), and which
+`test/java-stream.test.mjs` drives end to end on the patched classes (a ping is never probed, a join
+is, and a failed dial ends in `error` then `close`).
 
 
 One trap found on the way: the bundle replaces `window.WebSocket` with a proxy that hands a

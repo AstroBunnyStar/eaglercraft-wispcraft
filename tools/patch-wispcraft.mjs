@@ -404,7 +404,15 @@ if (js.includes(DIAL_INTENT_MARKER) && js.includes(DIAL_FAIL_MARKER)) {
      A() has to run *outside* the block below: that block declares `const A = await LA(...)`, so the
      parameter is in its temporal dead zone inside it and calling A() there throws into the SRV
      catch - the open event would never fire at all. */
-  js = js.replace(FWD_OPEN_ANCHOR, "async forward(A,__onFail){A();let I;try{");
+  js = js.replace(
+    FWD_OPEN_ANCHOR,
+    /* a microtask, not a direct call: WI.start() runs inside the socket's constructor (the bundle's
+       WebSocket proxy does this), so dispatching open there reaches nobody - a caller that does
+       `s = new WebSocket(..); s.onopen = ..` attaches its handler after the constructor returns. A
+       real socket delivers open asynchronously for the same reason. The frame wait below still
+       keeps open ahead of the dial. */
+    "async forward(A,__onFail){var __open=A;queueMicrotask(function(){try{__open()}catch(e){__onFail&&__onFail(e)}});let I;try{"
+  );
 
   /* VI.__fail(): open already fired, so a dial that never connects has to end in the events a real
      socket would send - error, then close - or the join waits forever on an open, silent socket */
