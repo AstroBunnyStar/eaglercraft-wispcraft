@@ -398,16 +398,27 @@
   window.wispcraftResolveSrv = resolveSrv;
   /* index.html probes relays against example.com and Microsoft, so a relay can pass its launch test
      and still be unable to reach the game server - which the client reports as "Wisp destination
-     host could not be reached (code 1006)". Reachability therefore has to be decided per target:
-     this opens a real Wisp stream to the server's own address and sends a status handshake, which
-     every Java server answers, so silence means the relay could not get there. When the relay in
-     use cannot reach the server, another relay that can is picked and stored, which is the key the
-     bundle reads for the relay it dials. Packet layout matches index.html:
-     [type][streamID u32 LE][body], CONNECT 0x01 with [streamType][port u16 LE][hostname],
-     CONTINUE 0x03, DATA 0x02, CLOSE 0x04. */
+     host could not be reached (code 1006)". Reachability therefore has to be decided per target,
+     with a real Wisp stream to the server's own address plus a status handshake, which every Java
+     server answers: silence means the relay could not get there. The check runs when the client
+     actually dials a server (bundle patch 9 awaits it there), for that one address only - never at
+     boot, and never for servers the player is not joining. When the relay in use cannot reach it,
+     the relays are tried one at a time, in preference order, and the first that answers wins; the
+     live client is then rebuilt on it, so the join itself goes out through the replacement. Packet
+     layout matches index.html: [type][streamID u32 LE][body], CONNECT 0x01 with
+     [streamType][port u16 LE][hostname], CONTINUE 0x03, DATA 0x02, CLOSE 0x04. */
   var RELAY_KEY = "wispcraft_wispurl", REACH_CACHE = "wispcraft_relay_reach", REACH_TTL = 10 * 60 * 1000;
+  /* one probe at a time, and a short list: a broken relay costs one timeout, not an eight-socket burst */
+  var REACH_TRIES = 4, REACH_TIMEOUT = 2500;
 
+  /* what the bundle actually dials, not merely what was last stored: the bundle publishes its
+     namespace and builds its client from wispcraft.wispUrl, so a stored key that never reached the
+     client cannot be mistaken for a relay in use (which is how a "switched" relay still failed) */
   function relayInUse() {
+    try {
+      var live = window.wispcraft && window.wispcraft.wispUrl;
+      if (typeof live === "string" && live) return live;
+    } catch (e) {}
     try {
       var saved = localStorage.getItem(RELAY_KEY);
       if (saved) return saved;
@@ -430,6 +441,26 @@
     var handshake = [0x00].concat(varint(47), varint(name.length), name, [(port >> 8) & 255, port & 255, 1]);
     return varint(handshake.length).concat(handshake, [0x01, 0x00]);
   }
+  /* The bundle replaces window.WebSocket with a proxy that sends a non-current relay address into its
+     EaglerX socket wrapper: that wrapper retries wss -> ws, then EaglerX, then even a java:// stream,
+     and never surfaces the first error, so a sweep through it marks every candidate dead - only the
+     relay already in use (which the proxy hands to the real constructor) could be probed. A hidden
+     same-origin iframe still has the pristine constructor, which is what a probe needs. */
+  function rawSocketCtor() {
+    if (window.__wispcraftRawSocket) return window.__wispcraftRawSocket;
+    try {
+      var frame = document.createElement("iframe");
+      frame.style.cssText = "display:none";
+      frame.tabIndex = -1;
+      frame.setAttribute("aria-hidden", "true");
+      (document.body || document.documentElement).appendChild(frame);
+      var native = frame.contentWindow && frame.contentWindow.WebSocket;
+      /* the frame stays: removing it can destroy the realm the constructor belongs to */
+      window.__wispcraftRawFrame = frame;
+      if (typeof native === "function") return (window.__wispcraftRawSocket = native);
+    } catch (e) {}
+    return null;
+  }
   function probeTarget(relayUrl, host, port, timeout) {
     return new Promise(function (finish) {
       var started = Date.now(), done = false, ws = null, timer = null;
@@ -440,7 +471,8 @@
         try { if (ws && ws.readyState === 1) ws.close(); } catch (e) {}
         finish({ relay: relayUrl, ok: ok, ms: Date.now() - started, why: why || "" });
       }
-      try { ws = new WebSocket(relayUrl); } catch (e) { return end(false, "socket"); }
+      var WS = rawSocketCtor() || WebSocket;
+      try { ws = new WS(relayUrl); } catch (e) { return end(false, "socket"); }
       ws.binaryType = "arraybuffer";
       timer = setTimeout(function () { end(false, "no answer"); }, timeout || 4000);
       ws.onopen = function () {
@@ -498,50 +530,109 @@
       localStorage.setItem(REACH_CACHE, JSON.stringify(all));
     } catch (e) {}
   }
+  /* Relays that answered before are tried first: with a sequential sweep the order decides what a
+     broken relay costs, and the usual winner in front makes it one failed probe plus one good one. */
+  var GOOD_KEY = "wispcraft_relay_good";
+  function goodRelays() {
+    try { return JSON.parse(localStorage.getItem(GOOD_KEY) || "{}") || {}; } catch (e) { return {}; }
+  }
+  function rememberGood(url) {
+    try {
+      var all = goodRelays();
+      all[url] = Date.now();
+      var keys = Object.keys(all).sort(function (a, b) { return all[b] - all[a]; }).slice(0, 8), keep = {};
+      for (var i = 0; i < keys.length; i++) keep[keys[i]] = all[keys[i]];
+      localStorage.setItem(GOOD_KEY, JSON.stringify(keep));
+    } catch (e) {}
+  }
+  /* Storage is not a switch. The bundle resolves its relay once, at startup, and builds its epoxy
+     client - and the wisp multiplexor the join dials through - from that value, so writing the key
+     afterwards leaves the client on the old relay. The bundle rebuilds the client for its own Wisp
+     Settings picker (fresh client, then replace_stream_provider); switchRelay is that sequence as an
+     export. A switch it does not confirm is reported as failed rather than assumed, because the
+     join would otherwise still go out through the relay that cannot reach the server. */
   function useRelay(url) {
     try { localStorage.setItem(RELAY_KEY, url); } catch (e) {}
+    var apply = window.wispcraft && window.wispcraft.switchRelay;
+    if (typeof apply !== "function") return Promise.resolve({ ok: false, why: "the bundle has no switchRelay" });
+    return Promise.resolve(apply.call(window.wispcraft, url)).then(function (res) {
+      if (res && res.ok && res.relay) return res;
+      return { ok: false, why: (res && res.why) || "the client refused it" };
+    }).catch(function (e) { return { ok: false, why: String((e && e.message) || e) }; });
   }
-  /* Resolves {relay, ok, switched}. One probe of the relay in use; only if that fails is the list
-     swept, and the fastest relay that reaches the server wins, so a blocked relay costs one probe
-     rather than the whole list. */
-  function ensureRelayReaches(host, port, opt) {
-    host = String(host || "").split(":")[0];
-    port = parseInt(port, 10) || 25565;
-    if (!host) return Promise.resolve(null);
-    var key = host + ":" + port, quiet = opt && opt.quiet;
+  function checkRelayReaches(key, host, port, opt) {
+    var quiet = opt && opt.quiet, mine = relayInUse();
     var cached = reachCached(key);
-    if (cached && cached.ok && cached.relay === relayInUse()) return Promise.resolve(cached);
-    if (cached && !cached.ok && cached.relay === relayInUse()) return Promise.resolve(cached);
-    var mine = relayInUse();
+    if (cached && cached.relay === mine) return Promise.resolve(cached);
     return probeTarget(mine, host, port).then(function (res) {
       if (res.ok) {
         reachRemember(key, mine, true);
+        rememberGood(mine);
         return res;
       }
       return relayList().then(function (all) {
-        var others = all.filter(function (u) { return u !== mine; });
-        /* keep this to a handful of sockets: the list has more than twenty entries, but a relay that
-           carries the session in index.html's probe is the plausible candidate */
-        var tried = others.slice(0, 8);
-        if (!tried.length) return res;
-        return Promise.all(tried.map(function (u) { return probeTarget(u, host, port, 4000); })).then(function (results) {
-          var good = results.filter(function (r) { return r.ok; }).sort(function (a, b) { return a.ms - b.ms; })[0];
-          if (!good) {
+        var good = goodRelays(), rest = [];
+        for (var i = 0; i < all.length; i++) {
+          if (all[i] !== mine && rest.indexOf(all[i]) < 0) rest.push(all[i]);
+        }
+        /* one socket at a time, and only until one answers: a list of twenty plus relays is not a
+           burst of parallel probes at third parties, and a relay that fails costs its timeout */
+        rest.sort(function (a, b) { return (good[b] ? 1 : 0) - (good[a] ? 1 : 0); });
+        var candidates = rest.slice(0, REACH_TRIES);
+        function next(i) {
+          if (i >= candidates.length) return null;
+          return probeTarget(candidates[i], host, port, REACH_TIMEOUT).then(function (r) {
+            return r.ok ? r : next(i + 1);
+          });
+        }
+        return Promise.resolve(next(0)).then(function (hit) {
+          if (!hit) {
             reachRemember(key, mine, false);
             if (!quiet) {
               window.wispcraftNote("no relay could reach " + key + " - the server may be down, or its shield may refuse relay traffic");
             }
-            return res;
+            return { relay: mine, ok: false, switched: false, why: res.why };
           }
-          useRelay(good.relay);
-          reachRemember(key, good.relay, true);
-          if (!quiet) {
-            window.wispcraftNote("relay " + relayHost(mine) + " could not reach " + key + ", switched to " + relayHost(good.relay));
-          }
-          return { relay: good.relay, ok: true, ms: good.ms, switched: true, from: mine };
+          return useRelay(hit.relay).then(function (applied) {
+            if (!applied.ok) {
+              try { localStorage.setItem(RELAY_KEY, mine); } catch (e) {}
+              if (!quiet) {
+                window.wispcraftNote("relay " + relayHost(mine) + " could not reach " + key + ", and " +
+                  relayHost(hit.relay) + " could but the client refused the switch (" + applied.why + ") - " +
+                  "change it in Wisp Settings -> Wisp Server");
+              }
+              return { relay: mine, ok: false, switched: false, why: "switch refused", candidate: hit.relay };
+            }
+            var now = applied.relay;
+            reachRemember(key, now, true);
+            rememberGood(now);
+            if (!quiet) {
+              window.wispcraftNote("relay " + relayHost(mine) + " could not reach " + key + ", switched to " +
+                relayHost(now) + " - the client dials " + relayHost(relayInUse()));
+            }
+            return { relay: now, ok: true, ms: hit.ms, switched: true, from: mine };
+          });
         });
       });
     }).catch(function () { return null; });
+  }
+  /* One check per target at a time: the client pings a server and then joins it, and two independent
+     probes would double the sockets and could race two switches against each other. */
+  var REACH_PENDING = {};
+  function ensureRelayReaches(host, port, opt) {
+    host = String(host || "").split(":")[0].toLowerCase();
+    port = parseInt(port, 10) || 25565;
+    if (!host) return Promise.resolve(null);
+    var key = host + ":" + port;
+    if (REACH_PENDING[key]) return REACH_PENDING[key];
+    var pending = checkRelayReaches(key, host, port, opt);
+    REACH_PENDING[key] = pending;
+    pending.then(function () {
+      if (REACH_PENDING[key] === pending) delete REACH_PENDING[key];
+    }, function () {
+      if (REACH_PENDING[key] === pending) delete REACH_PENDING[key];
+    });
+    return pending;
   }
   window.wispcraftEnsureRelayReaches = ensureRelayReaches;
   /* Quick Play (play.html?server=<host>) hands the host to the client as a plain address, and the
@@ -735,22 +826,46 @@
   function repairSavedServers() {
     if (!window.indexedDB) return Promise.resolve(0);
     var DB = "_net_lax1dude_eaglercraft_v1_8_internal_PlatformFilesystem_1_8_8_worlds";
+    /* Opening the client database with no version CREATES an empty one when none exists. On a profile that has never
+       run the client that is harmful: the client opens the same database expecting its "filesystem"
+       object store, finds none, and crashes on its first boot with "One of the specified object
+       stores was not found". So ask whether the database exists before opening it, and if an open
+       ever lands on a database with no stores, drop that empty shell instead of leaving it behind. */
+    function dbExists() {
+      if (typeof indexedDB.databases !== "function") return Promise.resolve(true);
+      return indexedDB.databases().then(function (list) {
+        for (var i = 0; i < list.length; i++) {
+          if (list[i] && list[i].name === DB) return true;
+        }
+        return false;
+      }).catch(function () { return true; });
+    }
     function withStore(mode, work) {
-      return new Promise(function (done) {
-        var open = indexedDB.open(DB);
-        open.onerror = function () { done(null); };
-        open.onsuccess = function () {
-          var db = open.result;
-          try {
-            work(db, db.transaction("filesystem", mode).objectStore("filesystem"), function (value) {
+      return dbExists().then(function (exists) {
+        if (!exists) return null;
+        return new Promise(function (done) {
+          var open = indexedDB.open(DB);
+          open.onerror = function () { done(null); };
+          open.onsuccess = function () {
+            var db = open.result;
+            if (!db.objectStoreNames.contains("filesystem")) {
+              var empty = db.objectStoreNames.length === 0;
               try { db.close(); } catch (e) {}
-              done(value);
-            });
-          } catch (err) {
-            try { db.close(); } catch (e) {}
-            done(null);
-          }
-        };
+              if (empty) { try { indexedDB.deleteDatabase(DB); } catch (e) {} }
+              done(null);
+              return;
+            }
+            try {
+              work(db, db.transaction("filesystem", mode).objectStore("filesystem"), function (value) {
+                try { db.close(); } catch (e) {}
+                done(value);
+              });
+            } catch (err) {
+              try { db.close(); } catch (e) {}
+              done(null);
+            }
+          };
+        });
       });
     }
     /* read first, resolve after: a transaction does not survive an await */
@@ -819,13 +934,8 @@
           };
           put.onerror = function () { finish(0); };
         }).then(function (written) {
-          /* the entry now names an endpoint: check the relay can actually dial it, and move to one
-             that can if this one cannot (the client's own error for that is a bare code 1006) */
-          for (var i = 0; i < pairs.length; i++) {
-            var p = String(pairs[i].target).split(":");
-            ensureRelayReaches(p[0], parseInt(p[1] || "25565", 10) || 25565);
-            break;
-          }
+          /* the repair only rewrites addresses. Reachability is checked when the client dials the
+             entry (bundle patch 9), so a visit no longer sweeps relays for servers nobody joins */
           return written || touched.length;
         });
       });

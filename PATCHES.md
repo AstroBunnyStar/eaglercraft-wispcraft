@@ -405,3 +405,53 @@ What this cannot do: rewrite the server list of a profile that already has an en
 server. That list belongs to the client, the saved list wins over the supplied one, and a page cannot
 reach it - an older entry pointing at the bare domain keeps timing out until it is redirected to the
 SRV host once (Edit -> address -> Done, Wisp mode already selected).
+## Relay failover: switching at run time, checking the target (patches 8 and 9, `play.html`)
+
+`index.html` proves a relay can reach `example.com` and Microsoft, which says nothing about the game
+server: a relay that passes its launch test can still answer `Wisp destination host could not be
+reached (code 1006)` for the address being joined. The launcher therefore checks the target itself -
+a real Wisp stream to the server address plus a status handshake, which every Java server answers.
+
+Three things had to change for that check to be worth anything:
+
+1. **A switch is not a storage write.** The bundle resolves its relay once
+   (`A.wispUrl = ... || localStorage.wispcraft_wispurl || OI`) and builds the epoxy client - and the
+   multiplexor the join dials through - from that value, so writing the key afterwards left the live
+   client on the old relay. That is how a "switched" relay still failed with 1006. Patch 8 publishes
+   the sequence the settings picker already uses (rebuild the client, then
+   `replace_stream_provider()`) as `window.wispcraft.switchRelay(url)`. It is serialised, so two
+   switches cannot swap clients under each other, and it returns the address the client now dials -
+   or `ok:false` with a reason, which the page reports instead of assuming the switch took.
+2. **The check runs at the dial, for that one entry.** Patch 9 awaits
+   `window.wispcraftEnsureRelayReaches(host, port)` inside `forward()`, for the address actually
+   being dialed (after SRV), before `connect_tcp`. The page no longer probes at boot: the earlier
+   version probed the first repaired entry on every visit (its `pairs` reference was undefined, so it
+   threw into the repair catch) and its fallback opened eight sockets at third-party relays in
+   parallel.
+3. **Sequential, bounded, ordered.** A failed relay costs one 2.5 s probe; then candidates are tried
+   one at a time, at most four, stopping at the first that answers. Relays that answered before go
+   first (`wispcraft_relay_good`). Verdicts are cached per target for 10 minutes and keyed to the
+   relay, so a Multiplayer ping followed by the join costs no second socket, and two concurrent
+   checks for the same target share one sweep.
+
+Measured live (2026-11-22): with `wispcraft_wispurl` pointed at `wss://us-east.wisp.q13x.com/` (a
+relay that no longer carries traffic), the client's own `java://geo.minemen.club:25565` socket
+switched to `wss://truffled.lol/wisp/` before connecting - the console printed
+`relay us-east.wisp.q13x.com could not reach geo.minemen.club:25565, switched to truffled.lol - the
+client dials truffled.lol`, `window.wispcraft.wispUrl` changed with it, and the relay socket opened on the
+replacement. `.tmp/reach-test.mjs` pins the same behaviour without a browser (one probe at a time,
+early stop, the switch call, the refused-switch path, the cache, and both bundle markers).
+
+
+One trap found on the way: the bundle replaces `window.WebSocket` with a proxy that hands a
+non-current relay address to its EaglerX wrapper, which retries `wss` -> `ws` -> EaglerX and swallows
+the first reply, so a probe built on `window.WebSocket` marks every candidate dead - `truffled.lol`
+timed out at 4.3 s through the proxy and answered `geo.minemen.club:25565` in 154 ms through a
+pristine constructor. `probeTarget()` therefore takes the constructor from a hidden same-origin
+iframe, where the page has not replaced it.
+
+While testing this, the boot-time repair turned out to crash a **fresh** profile: opening the client
+database with `indexedDB.open(name)` and no version creates it empty, and the client then finds no
+`filesystem` object store and dies at *Initializing game* with *One of the specified object stores
+was not found*. `repairSavedServers()` now checks `indexedDB.databases()` before opening, and deletes
+an empty shell it ever lands on, so a first visit boots.

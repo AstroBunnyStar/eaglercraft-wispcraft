@@ -16,6 +16,8 @@
  *   4. SRV resolution - asks the launcher's cached resolver before the relay dials a Java host.
  *   5. Quick play transport - a matching wss:// address is routed into the Wisp stream.
  *   6. Server entry - appends the launcher's java:// entry to the list the client builds at boot.
+ *   7. Runtime relay switch - rebuilds the client on a new relay, so a page can change it after boot.
+ *   8. Reach check at dial - asks the launcher whether the relay can reach this server before the join.
  * 7 before 4/5/6 because it rewrites the line patch 3 leaves behind; the numbers otherwise follow
  * the order they were added to the launcher, not the order they run.
  *
@@ -302,6 +304,70 @@ if (js.includes(ENTRY_MARKER)) {
   js = js.replace(ENTRY_ANCHOR, entrySrc);
   changed++;
   lines.push("[fix]  launcher-supplied server entry appended to eaglercraftXOpts.servers");
+}
+
+// ---------------------------------------------------------------- patch 8: the relay can be switched at run time
+// The bundle resolves its relay once, at module init (`A.wispUrl = ... || localStorage[..] || OI`),
+// and builds the epoxy client (and its wisp multiplexor) from that value. Writing the localStorage
+// key afterwards therefore changes nothing the client dials - a page that "switches relay" that way
+// only fools itself, and the join still fails with code 1006. The settings picker already knows the
+// real sequence (rebuild the client, then replace the wasm side's stream provider); this publishes
+// it as `window.wispcraft.switchRelay(url)` so the launcher can move a live join to a relay that can
+// reach the server, and report the address the client now dials.
+const SWITCH_MARKER = ".switchRelay=";
+const SWITCH_ANCHOR = "A.setWispUrl=TI,";
+
+if (js.includes(SWITCH_MARKER)) {
+  lines.push("[ok]   runtime relay switch already present");
+} else if (!repairMatch || !readyMatch || !initFn || js.split(SWITCH_ANCHOR).length - 1 !== 1) {
+  lines.push("[skip] runtime relay switch: could not resolve the client, its ready promise or the export tail");
+} else {
+  const client = repairMatch[3], readyPromise = repairMatch[2], resolver = readyMatch[2];
+  const switchSrc =
+    "A.switchRelay=function(url){" +
+    "var run=function(){var prev=A.wispUrl;return (async function(){" +
+    /* the boot build may still be in flight; it resolves this promise and would otherwise do so
+       again after the rebuild, leaving the two clients swapped */
+    `await ${readyPromise};` +
+    'var want;try{want=new URL(String(url));want.pathname.endsWith("/")||(want.pathname+="/"),want=want.href}' +
+    'catch(e){return {ok:false,why:"invalid url"}}' +
+    `if(want===A.wispUrl&&${client})return {ok:true,relay:want,unchanged:true};` +
+    `A.wispUrl=want,${readyPromise}=new Promise(function(r){${resolver}=r}),${initFn}(want),` +
+    `await ${readyPromise},await ${client}.replace_stream_provider();` +
+    'try{localStorage.setItem("wispcraft_wispurl",want)}catch(e){}' +
+    "return {ok:true,relay:want,previous:prev}" +
+    "})()};" +
+    "var p=(A.__relaySwitch||Promise.resolve()).then(run);" +
+    "A.__relaySwitch=p.then(function(r){return r},function(e){return {ok:false,why:String((e&&e.message)||e)}});" +
+    "return A.__relaySwitch};";
+  js = js.replace(SWITCH_ANCHOR, switchSrc + SWITCH_ANCHOR);
+  changed++;
+  lines.push(`[fix]  runtime relay switch exported as switchRelay (${client}, ${initFn}, ${readyPromise})`);
+}
+
+// ---------------------------------------------------------------- patch 9: a join checks its relay first
+// The java stream resolves the server (SRV) and then dials the relay. Nothing before that dial asks
+// whether this relay can reach this server, and the client's only symptom is a bare code 1006. The
+// launcher owns a real probe (a Wisp stream plus a status handshake) and a switch, so the stream
+// awaits it here, once, for the address actually being dialed - which is what keeps the launcher
+// from probing relays at boot or for servers it is not joining.
+const DIAL_ANCHOR = "const g=await async function(A){return await SA,await KA.connect_tcp(A)}(I?I.host:this.url.host);";
+const DIAL_MARKER = "window.wispcraftEnsureRelayReaches(__reach";
+
+if (js.includes(DIAL_MARKER)) {
+  lines.push("[ok]   dial-time reach check already present");
+} else if (js.split(DIAL_ANCHOR).length - 1 !== 1) {
+  lines.push("[skip] dial-time reach check: the java connect call was not found");
+} else {
+  const dial =
+    'var __reachHost=I?I.hostname:this.url.hostname,' +
+    '__reachPort=parseInt((I?I.port:this.url.port)||"25565",10)||25565;' +
+    "if(window.wispcraftEnsureRelayReaches&&__reachHost){" +
+    "try{await window.wispcraftEnsureRelayReaches(__reachHost,__reachPort)}catch(e){}}" +
+    DIAL_ANCHOR;
+  js = js.replace(DIAL_ANCHOR, dial);
+  changed++;
+  lines.push("[fix]  java connect awaits the launcher's reach check for the target being dialed");
 }
 
 // ---------------------------------------------------------------- validate before writing
