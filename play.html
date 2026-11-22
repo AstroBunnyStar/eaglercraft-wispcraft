@@ -400,11 +400,14 @@
      and still be unable to reach the game server - which the client reports as "Wisp destination
      host could not be reached (code 1006)". Reachability therefore has to be decided per target,
      with a real Wisp stream to the server's own address plus a status handshake, which every Java
-     server answers: silence means the relay could not get there. The check runs when the client
-     actually dials a server (bundle patch 9 awaits it there), for that one address only - never at
-     boot, and never for servers the player is not joining. When the relay in use cannot reach it,
+     server answers: silence means the relay could not get there. It is a join-only check: bundle
+     patch 9 dispatches open before it dials and waits for the client's first frame, so a status
+     ping (the string "accept: motd") never calls this and only a join does, for the one address it
+     is dialing, after SRV. Nothing here runs at boot. When the relay in use cannot reach it,
      the relays are tried one at a time, in preference order, and the first that answers wins; the
-     live client is then rebuilt on it, so the join itself goes out through the replacement. Packet
+     live client is then rebuilt on it, so the join itself goes out through the replacement. That
+     rebuild is refused while other connections are still opening (patch 8's connect gate), so a
+     ping sweep cannot be swapped out mid-connect. Packet
      layout matches index.html: [type][streamID u32 LE][body], CONNECT 0x01 with
      [streamType][port u16 LE][hostname], CONTINUE 0x03, DATA 0x02, CLOSE 0x04. */
   var RELAY_KEY = "wispcraft_wispurl", REACH_CACHE = "wispcraft_relay_reach", REACH_TTL = 10 * 60 * 1000;
@@ -934,8 +937,9 @@
           };
           put.onerror = function () { finish(0); };
         }).then(function (written) {
-          /* the repair only rewrites addresses. Reachability is checked when the client dials the
-             entry (bundle patch 9), so a visit no longer sweeps relays for servers nobody joins */
+          /* the repair only rewrites addresses. Reachability is checked for a join (bundle patch 9
+             waits for the client's first frame), so a visit no longer sweeps relays for servers
+             nobody joins */
           return written || touched.length;
         });
       });

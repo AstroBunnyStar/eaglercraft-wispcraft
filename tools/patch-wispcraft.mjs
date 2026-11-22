@@ -16,8 +16,8 @@
  *   4. SRV resolution - asks the launcher's cached resolver before the relay dials a Java host.
  *   5. Quick play transport - a matching wss:// address is routed into the Wisp stream.
  *   6. Server entry - appends the launcher's java:// entry to the list the client builds at boot.
- *   7. Runtime relay switch - rebuilds the client on a new relay, so a page can change it after boot.
- *   8. Reach check at dial - asks the launcher whether the relay can reach this server before the join.
+ *   8. Runtime relay switch - rebuilds the client on a new relay, gated on connects that are still opening.
+ *   9. Join-only reach check - asks the launcher whether the relay can reach this server, and only for a join.
  * 7 before 4/5/6 because it rewrites the line patch 3 leaves behind; the numbers otherwise follow
  * the order they were added to the launcher, not the order they run.
  *
@@ -314,15 +314,33 @@ if (js.includes(ENTRY_MARKER)) {
 // real sequence (rebuild the client, then replace the wasm side's stream provider); this publishes
 // it as `window.wispcraft.switchRelay(url)` so the launcher can move a live join to a relay that can
 // reach the server, and report the address the client now dials.
+//
+// A rebuild swaps the stream provider under every stream the client has open, so switchRelay also
+// owns the gate the java stream uses around connect_tcp: it waits for the connections that are
+// still opening (a Multiplayer ping sweep is a burst of them) and holds new ones back until the
+// rebuild is done. If they do not finish in time it refuses the switch instead of pulling the
+// provider out from under them.
 const SWITCH_MARKER = ".switchRelay=";
 const SWITCH_ANCHOR = "A.setWispUrl=TI,";
+const GATE_MARKER = ".__enterConnect=";
 
-if (js.includes(SWITCH_MARKER)) {
+if (js.includes(SWITCH_MARKER) && js.includes(GATE_MARKER)) {
   lines.push("[ok]   runtime relay switch already present");
 } else if (!repairMatch || !readyMatch || !initFn || js.split(SWITCH_ANCHOR).length - 1 !== 1) {
   lines.push("[skip] runtime relay switch: could not resolve the client, its ready promise or the export tail");
 } else {
   const client = repairMatch[3], readyPromise = repairMatch[2], resolver = readyMatch[2];
+  const gateSrc =
+    "A.__connects=0,A.__idleWaiters=[],A.__connectWaiters=[];" +
+    "A.__enterConnect=function(){if(!A.__switching){A.__connects++;return Promise.resolve()}" +
+    "return new Promise(function(r){A.__connectWaiters.push(function(){A.__connects++,r()})})};" +
+    "A.__leaveConnect=function(){if(A.__connects>0)A.__connects--;" +
+    "if(!A.__connects){var w=A.__idleWaiters;A.__idleWaiters=[];for(var i=0;i<w.length;i++)w[i]()}};" +
+    /* resolves false when the connects that were running have not finished within ms */
+    "A.__idle=function(ms){if(!A.__connects)return Promise.resolve(true);" +
+    "return new Promise(function(res){var d=0,t=setTimeout(function(){if(!d){d=1,res(false)}},ms);" +
+    "A.__idleWaiters.push(function(){if(!d){d=1,clearTimeout(t),res(true)}})})};" +
+    "A.__releaseConnects=function(){var w=A.__connectWaiters;A.__connectWaiters=[];for(var i=0;i<w.length;i++)w[i]()};";
   const switchSrc =
     "A.switchRelay=function(url){" +
     "var run=function(){var prev=A.wispUrl;return (async function(){" +
@@ -332,42 +350,83 @@ if (js.includes(SWITCH_MARKER)) {
     'var want;try{want=new URL(String(url));want.pathname.endsWith("/")||(want.pathname+="/"),want=want.href}' +
     'catch(e){return {ok:false,why:"invalid url"}}' +
     `if(want===A.wispUrl&&${client})return {ok:true,relay:want,unchanged:true};` +
+    "A.__switching=!0;var idle=await A.__idle(6000);" +
+    "if(!idle){A.__switching=!1,A.__releaseConnects();" +
+    'return {ok:false,why:"other connections are still opening"}};' +
+    "try{" +
     `A.wispUrl=want,${readyPromise}=new Promise(function(r){${resolver}=r}),${initFn}(want),` +
     `await ${readyPromise},await ${client}.replace_stream_provider();` +
     'try{localStorage.setItem("wispcraft_wispurl",want)}catch(e){}' +
     "return {ok:true,relay:want,previous:prev}" +
+    "}finally{A.__switching=!1,A.__releaseConnects()}" +
     "})()};" +
     "var p=(A.__relaySwitch||Promise.resolve()).then(run);" +
     "A.__relaySwitch=p.then(function(r){return r},function(e){return {ok:false,why:String((e&&e.message)||e)}});" +
     "return A.__relaySwitch};";
-  js = js.replace(SWITCH_ANCHOR, switchSrc + SWITCH_ANCHOR);
+  js = js.replace(SWITCH_ANCHOR, gateSrc + switchSrc + SWITCH_ANCHOR);
   changed++;
-  lines.push(`[fix]  runtime relay switch exported as switchRelay (${client}, ${initFn}, ${readyPromise})`);
+  lines.push(`[fix]  runtime relay switch with a connect gate (${client}, ${initFn}, ${readyPromise})`);
 }
 
-// ---------------------------------------------------------------- patch 9: a join checks its relay first
-// The java stream resolves the server (SRV) and then dials the relay. Nothing before that dial asks
-// whether this relay can reach this server, and the client's only symptom is a bare code 1006. The
-// launcher owns a real probe (a Wisp stream plus a status handshake) and a switch, so the stream
-// awaits it here, once, for the address actually being dialed - which is what keeps the launcher
-// from probing relays at boot or for servers it is not joining.
-const DIAL_ANCHOR = "const g=await async function(A){return await SA,await KA.connect_tcp(A)}(I?I.host:this.url.host);";
-const DIAL_MARKER = "window.wispcraftEnsureRelayReaches(__reach";
+// ---------------------------------------------------------------- patch 9: a join checks its relay first, a ping does not
+// The java stream is used for two very different things: the Multiplayer screen pings every entry to
+// draw its MOTD, and the player joins one server. Both arrive as `java://` sockets, and they look
+// identical until the client's first frame - a ping sends the string "accept: motd", a join sends its
+// binary handshake. So the stream dispatches `open` before it dials, waits for that first frame, and
+// only a join waits on the launcher's reach probe and possibly a relay switch. A status ping never
+// touches the relay choice, which is what keeps a Multiplayer screen from probing for servers nobody
+// is joining. The dial itself is deferred until then, so a switch still happens before the join's TCP
+// is opened, and it is bracketed by the connect gate patch 8 publishes.
+const DIAL_INTENT_MARKER = "__wispDialIntent";
+const FWD_OPEN_ANCHOR = "async forward(A){let I;try{";
+/* the trailing A() is the original "connected" callback: open is dispatched before the dial now, so
+   it is consumed by the replacement instead of firing twice */
+const DIAL_ANCHOR = "const g=await async function(A){return await SA,await KA.connect_tcp(A)}(I?I.host:this.url.host);A();";
+const SEND_ANCHOR = 'send(A){let I;if("string"!=typeof A){';
+const MOTD_ANCHOR = 'else"accept: motd"==A.toLowerCase()&&this.inner.ping()}';
+const IMPL_ANCHOR = "this.impl=B}ping(){";
 
-if (js.includes(DIAL_MARKER)) {
-  lines.push("[ok]   dial-time reach check already present");
-} else if (js.split(DIAL_ANCHOR).length - 1 !== 1) {
-  lines.push("[skip] dial-time reach check: the java connect call was not found");
+const dialAnchors = [FWD_OPEN_ANCHOR, DIAL_ANCHOR, SEND_ANCHOR, MOTD_ANCHOR, IMPL_ANCHOR];
+const dialAnchorOk = dialAnchors.every((a) => js.split(a).length - 1 === 1);
+
+if (js.includes(DIAL_INTENT_MARKER)) {
+  lines.push("[ok]   join-only reach check already present");
+} else if (!dialAnchorOk) {
+  lines.push("[skip] join-only reach check: the java stream anchors were not all found once");
 } else {
+  /* open first: the client identifies itself in its first frame, and a join buffers that handshake
+     until the connection below is established */
+  js = js.replace(FWD_OPEN_ANCHOR, FWD_OPEN_ANCHOR + "A();");
+
+  js = js.replace(
+    SEND_ANCHOR,
+    "send(A){var __f=typeof A===\"string\"&&\"accept: motd\"===A.toLowerCase()?\"motd\":\"data\";" +
+      "if(void 0===this.inner.__frame){this.inner.__frame=__f;var __d=this.inner.__decide;" +
+      "__d&&(this.inner.__decide=null,__d(__f))}" +
+      SEND_ANCHOR.slice("send(A){".length)
+  );
+  /* the anchor ends with the brace that closes send(), so the replacement has to keep it */
+  js = js.replace(MOTD_ANCHOR, 'else if("accept: motd"==A.toLowerCase()){this.inner.impl?this.inner.ping():this.inner.__wantPing=1}}');
+  js = js.replace(IMPL_ANCHOR, "this.impl=B,this.__wantPing&&(this.__wantPing=0,this.ping())}ping(){");
+
   const dial =
-    'var __reachHost=I?I.hostname:this.url.hostname,' +
-    '__reachPort=parseInt((I?I.port:this.url.port)||"25565",10)||25565;' +
-    "if(window.wispcraftEnsureRelayReaches&&__reachHost){" +
-    "try{await window.wispcraftEnsureRelayReaches(__reachHost,__reachPort)}catch(e){}}" +
-    DIAL_ANCHOR;
+    "/* __wispDialIntent: wait for the client's first frame before dialing */" +
+    "var __self=this,__h=I?I.hostname:this.url.hostname," +
+    '__p=parseInt((I?I.port:this.url.port)||"25565",10)||25565,' +
+    "__t=I?I.host:this.url.host;" +
+    "if(void 0===__self.__frame){await new Promise(function(r){var d=0;" +
+    '__self.__decide=function(v){if(d)return;d=1,r(v)};' +
+    'setTimeout(function(){if(!d){d=1,r("data")}},4000)})}' +
+    'if(__self.__frame!=="motd"&&window.wispcraftEnsureRelayReaches&&__h){' +
+    "try{await window.wispcraftEnsureRelayReaches(__h,__p)}catch(e){}}" +
+    "var __ns=window.wispcraft,__g;" +
+    "if(__ns&&__ns.__enterConnect)await __ns.__enterConnect();" +
+    "try{__g=await async function(x){return await SA,await KA.connect_tcp(x)}(__t)}" +
+    "finally{if(__ns&&__ns.__leaveConnect)__ns.__leaveConnect()}" +
+    "const g=__g;";
   js = js.replace(DIAL_ANCHOR, dial);
   changed++;
-  lines.push("[fix]  java connect awaits the launcher's reach check for the target being dialed");
+  lines.push("[fix]  java stream asks for the reach check only for a join, and dials behind the connect gate");
 }
 
 // ---------------------------------------------------------------- validate before writing

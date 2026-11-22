@@ -405,12 +405,18 @@ What this cannot do: rewrite the server list of a profile that already has an en
 server. That list belongs to the client, the saved list wins over the supplied one, and a page cannot
 reach it - an older entry pointing at the bare domain keeps timing out until it is redirected to the
 SRV host once (Edit -> address -> Done, Wisp mode already selected).
-## Relay failover: switching at run time, checking the target (patches 8 and 9, `play.html`)
+## Relay failover: switching at run time, checking the join (patches 8 and 9, `play.html`)
 
 `index.html` proves a relay can reach `example.com` and Microsoft, which says nothing about the game
 server: a relay that passes its launch test can still answer `Wisp destination host could not be
 reached (code 1006)` for the address being joined. The launcher therefore checks the target itself -
 a real Wisp stream to the server address plus a status handshake, which every Java server answers.
+
+That check belongs to a **join**, not to a ping. The Multiplayer screen pings every entry in the list
+to draw its MOTD, and a ping sweep must not probe relays or move the session: it would test servers
+nobody is joining and could switch the relay under a list that is only being drawn. Patch 9 draws
+that line (point 2 below), and patch 8 refuses a switch that would rebuild the client while other
+connections are still opening (point 1).
 
 Three things had to change for that check to be worth anything:
 
@@ -422,25 +428,40 @@ Three things had to change for that check to be worth anything:
    `replace_stream_provider()`) as `window.wispcraft.switchRelay(url)`. It is serialised, so two
    switches cannot swap clients under each other, and it returns the address the client now dials -
    or `ok:false` with a reason, which the page reports instead of assuming the switch took.
-2. **The check runs at the dial, for that one entry.** Patch 9 awaits
-   `window.wispcraftEnsureRelayReaches(host, port)` inside `forward()`, for the address actually
-   being dialed (after SRV), before `connect_tcp`. The page no longer probes at boot: the earlier
-   version probed the first repaired entry on every visit (its `pairs` reference was undefined, so it
-   threw into the repair catch) and its fallback opened eight sockets at third-party relays in
-   parallel.
+   It also owns a connect gate. A rebuild swaps the stream provider under every socket the client
+   has open, and a Multiplayer ping sweep is a burst of them, so `switchRelay` first waits for the
+   connections that are still opening and holds new ones back while it rebuilds. If they have not
+   finished after 6 s it refuses with `ok:false, why:"other connections are still opening"`
+   instead of pulling the provider out from under them; the page reports that and leaves the relay
+   alone.
+2. **Only the join is checked.** A ping and a join arrive as the same `java://` socket and are
+   indistinguishable until the client's first frame: a status ping sends the string `accept: motd`,
+   a join sends its binary handshake. Patch 9 therefore dispatches `open` first, defers `connect_tcp`
+   until that first frame has arrived, and awaits `window.wispcraftEnsureRelayReaches(host, port)`
+   only for a join - for the address actually being dialed, after SRV. A ping dials the relay as it
+   always did, with no probe and no switch. The deferred dial is what keeps the order right: the
+   reach check and any switch complete before the join's TCP stream is opened, and the dial itself is
+   bracketed by the gate above, so a switch can neither rebuild mid-connect nor start while the
+   join's own connection is being opened.
+   The page does not probe at boot either: the earlier version probed the first repaired entry on
+   every visit (its `pairs` reference was undefined, so it threw into the repair catch) and its
+   fallback opened eight sockets at third-party relays in parallel.
 3. **Sequential, bounded, ordered.** A failed relay costs one 2.5 s probe; then candidates are tried
    one at a time, at most four, stopping at the first that answers. Relays that answered before go
    first (`wispcraft_relay_good`). Verdicts are cached per target for 10 minutes and keyed to the
-   relay, so a Multiplayer ping followed by the join costs no second socket, and two concurrent
-   checks for the same target share one sweep.
+   relay, so a second join of the same server on the same relay costs no new socket, and two
+   concurrent checks for the same target share one sweep.
 
-Measured live (2026-11-22): with `wispcraft_wispurl` pointed at `wss://us-east.wisp.q13x.com/` (a
-relay that no longer carries traffic), the client's own `java://geo.minemen.club:25565` socket
-switched to `wss://truffled.lol/wisp/` before connecting - the console printed
+Measured live (2026-11-22), with the earlier form of patch 9 that checked at every dial: with
+`wispcraft_wispurl` pointed at `wss://us-east.wisp.q13x.com/` (a relay that no longer carries
+traffic), the client's own `java://geo.minemen.club:25565` socket switched to
+`wss://truffled.lol/wisp/` before connecting - the console printed
 `relay us-east.wisp.q13x.com could not reach geo.minemen.club:25565, switched to truffled.lol - the
 client dials truffled.lol`, `window.wispcraft.wispUrl` changed with it, and the relay socket opened on the
-replacement. `.tmp/reach-test.mjs` pins the same behaviour without a browser (one probe at a time,
-early stop, the switch call, the refused-switch path, the cache, and both bundle markers).
+replacement. That run exercised the switch and the wiring, not the new split: patch 9 now asks for the
+check only after a join's first frame, which `.tmp/reach-test.mjs` pins without a browser
+(one probe at a time, early stop, the switch call, the refused-switch path, the cache, and the bundle
+markers for the deferred dial, the join-only guard and the connect gate).
 
 
 One trap found on the way: the bundle replaces `window.WebSocket` with a proxy that hands a
