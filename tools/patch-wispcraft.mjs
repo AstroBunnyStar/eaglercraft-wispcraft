@@ -531,10 +531,14 @@ if (js.includes(STREAM_MARKER)) {
 //     session - went through patch 10's reporter, so a normal disconnect reached the game as an
 //     `error` before the `close` (observed live as the failure note, "stream error", for a target the
 //     relay could not reach at all).
-// Both now take one quiet close: no `error`, one `close`, no failure note. The loops that are still
-// running are told to wind up silently (__wispQuiet), so a second ending cannot add a note or a
-// second close, and a socket that was already closed is never closed again.
+// Both now take one quiet close: no `error`, one `close`. The quiet close stays out of the player's
+// way, but a join that ends this way must still leave a trace: the launcher log gets one plain note
+// naming the address that was dialled, so a session that dies with no relay error is not a blank
+// line in the log. The loops that are still running are told to wind up silently (__wispQuiet), so a
+// second ending cannot add a note or a second close, and a socket that was already closed is never
+// closed again.
 const QUIET_MARKER = "__quietClose()";
+const QUIET_NOTE_MARKER = "java stream ended for ";
 const FWD_SIG_ANCHOR = "async forward(A,__onFail){";
 const FAIL_SRC_ANCHOR =
   'var __sf=function(e){window.wispcraftNote&&window.wispcraftNote("java stream failed after connect: "+' +
@@ -547,8 +551,10 @@ const CLOSE_BODY_ANCHOR =
   "this.readyState=WebSocket.CLOSING;try{this.inner.eaglerIn.abort()}catch(A){}this.readyState=WebSocket.CLOSED}}";
 
 const quietAnchors = [FWD_SIG_ANCHOR, FAIL_SRC_ANCHOR, START_CB_ANCHOR, OUT_CATCH_ANCHOR, CLOSE_BODY_ANCHOR];
-if (js.includes(QUIET_MARKER)) {
+if (js.includes(QUIET_MARKER) && js.includes(QUIET_NOTE_MARKER)) {
   lines.push("[ok]   quiet close already present");
+} else if (js.includes(QUIET_MARKER)) {
+  lines.push("[skip] quiet close: this bundle has the earlier quiet close but no end-of-stream note; regenerate it from the base bundle");
 } else if (
   !js.includes(STREAM_MARKER) ||
   js.split(DONE_BRANCH).length - 1 !== 2 ||
@@ -561,8 +567,14 @@ if (js.includes(QUIET_MARKER)) {
   js = js.replace(FWD_SIG_ANCHOR, "async forward(A,__onFail,__onDone){");
   js = js.replace(
     FAIL_SRC_ANCHOR,
-    "var __done=function(){__self.__wispQuiet=1,__onDone&&__onDone()}," +
-      "__sf=function(e){if(__self.__wispQuiet)return;" +
+    /* a clean end still says so in the log, once, naming what was dialled. `__self` here is the
+       stream impl (`this` in forward()), not the socket, which is why the flags sit on the impl
+       next to __wispQuiet - the same object close() marks. A stream that already failed, or a
+       socket the game closed on purpose, says nothing: its own path already spoke. */
+    "var __done=function(){if(!__self.__wispQuiet&&!__self.__wispFail&&window.wispcraftNote&&__t)" +
+      'window.wispcraftNote("java stream ended for "+__t+" (closed with no relay error)");' +
+      "__self.__wispQuiet=1,__onDone&&__onDone()}," +
+      "__sf=function(e){if(__self.__wispQuiet)return;__self.__wispFail=1;" +
       'window.wispcraftNote&&window.wispcraftNote("java stream failed after connect: "+' +
       'String((e&&(e.message||e))||"stream error")),__onFail&&__onFail(e)};try{'
   );

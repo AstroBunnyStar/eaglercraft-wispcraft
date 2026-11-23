@@ -222,6 +222,13 @@ test("relay failover: sequential sweep, a refused switch, and the join-only chec
     check("a clean end of stream is reported as a quiet close",
       !/void __sf\(\)/.test(js) && (js.match(/void __done\(\)/g) || []).length === 2,
       `${(js.match(/void __done\(\)/g) || []).length} quiet ends`);
+    const doneAt = js.indexOf("var __done=function(){");
+    const doneBody = doneAt < 0 ? "" : js.slice(doneAt, doneAt + 280);
+    check("a clean end names the address in the log once",
+      /wispcraftNote\("java stream ended for "\+__t/.test(doneBody), doneBody.slice(0, 90));
+    check("that note is skipped once the stream already failed or was closed",
+      /!__self\.__wispQuiet&&!__self\.__wispFail&&window\.wispcraftNote/.test(doneBody) &&
+        /__sf=function\(e\)\{if\(__self\.__wispQuiet\)return;__self\.__wispFail=1;/.test(js), doneBody.slice(0, 90));
     check("close() sends the event a real socket sends", /close\(\)\{this\.__quietClose\(\)\}/.test(js), "");
     check("the first frame classifies the socket",
       /send\(A\)\{var __f=typeof A==="string"&&"accept: motd"===A\.toLowerCase\(\)\?"motd":"data"/.test(js), "");

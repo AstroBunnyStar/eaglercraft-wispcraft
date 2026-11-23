@@ -471,7 +471,11 @@ Three things had to change for that check to be worth anything:
    Not every ending is a failure, and patch 11 draws that line. A stream that simply **ends** - the
    relay or the server closing its side, which is what the ordinary end of a session and a target the
    relay cannot reach both look like - is no longer reported as an error: it is one `close`, with no
-   failure note, exactly as before patch 10 for a socket that had never opened. And the game's own
+   failure note, exactly as before patch 10 for a socket that had never opened. It still leaves one
+   plain note in the launcher log, `java stream ended for <host:port> (closed with no relay error)`,
+   so a join that dies this way names the address it was dialling instead of ending in silence; the
+   note is skipped when the socket was already closed (the game hung up, or another path has already
+   reported), so it is exactly one line for one unexpected end. And the game's own
    `close()` used to send no event at all (it only flipped `readyState`, so a client waiting for the
    close event never got one); it now sends that one `close` too. Both paths mark the socket quiet
    first, so the read loops that are still running wind up without a second event or a note, and a

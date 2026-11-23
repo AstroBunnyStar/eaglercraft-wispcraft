@@ -299,13 +299,16 @@ test("java stream: a ping is not probed, a join is, and a failed dial closes the
     check(`${name} leaves the socket closed`, ws.readyState === 3, String(ws.readyState));
     check(`${name} is reported to the player`,
       ctx.notes.some((n) => /java stream failed after connect/.test(n) && why.test(n)), ctx.notes.join(" | ") || "no notes");
+    /* the failure already spoke: the clean-end note must not follow it */
+    check(`${name} adds no end-of-stream note`,
+      !ctx.notes.some((n) => /java stream ended for/.test(n)), ctx.notes.join(" | ") || "no notes");
     check(`${name} leaves no unhandled rejection`, unhandled.length === 0, unhandled.join(" | "));
     check(`${name} releases the connect gate`, ctx.connects === 0 && ctx.log.includes("leave"), ctx.log.join(" "));
   }
 
   /* 9. a close nobody is sorry about. A stream that ENDS is the ordinary end of a session, not a
      failure: it used to go through patch 10's reporter and reach the game as `error` then `close`.
-     It is now one quiet close, with no failure note. */
+     It is now one quiet close, with no failure note - but the log still says which address ended. */
   {
     const ctx = makeCtx();
     ctx.streamEnds = true;
@@ -320,6 +323,9 @@ test("java stream: a ping is not probed, a join is, and a failed dial closes the
     check("the clean end leaves the socket closed", ws.readyState === 3, String(ws.readyState));
     check("a clean end is not reported as a stream failure",
       !ctx.notes.some((n) => /java stream failed after connect/.test(n)), ctx.notes.join(" | ") || "no notes");
+    check("a clean end says once in the log which address ended",
+      ctx.notes.filter((n) => n === "java stream ended for geo.test.example:25565 (closed with no relay error)").length === 1,
+      ctx.notes.join(" | ") || "no notes");
     check("the clean end releases the connect gate", ctx.connects === 0 && ctx.log.includes("leave"), ctx.log.join(" "));
   }
 
@@ -358,6 +364,9 @@ test("java stream: a ping is not probed, a join is, and a failed dial closes the
     check(`${name} reports nothing as a stream failure`,
       !ctx.notes.some((n) => /java stream failed after connect|relay dial failed/.test(n)),
       ctx.notes.join(" | ") || "no notes");
+    /* the client closed on purpose, so nothing ended behind its back: no note either */
+    check(`${name} adds no end-of-stream note`,
+      !ctx.notes.some((n) => /java stream ended for/.test(n)), ctx.notes.join(" | ") || "no notes");
     check(`${name} leaves no unhandled rejection`, unhandled.length === 0, unhandled.join(" | "));
     check(`${name} releases the connect gate`, ctx.connects === 0 && ctx.log.includes("leave"), ctx.log.join(" "));
     /* a second close is still not an event: a real socket reports the close once */
