@@ -9,9 +9,12 @@
  *   6. a connect that arrives during a switch is held, then released;
  *   7. open reaches a listener that attaches after the constructor, and a failed dial ends in
  *      error then close rather than a socket that looks connected forever;
- *   8. a stream that fails or ends *after* a successful dial - the relay accepted the stream but the
- *      target refused or dropped it - ends the socket the same way, as does the connected-stream
- *      setup throwing and the socket's own outbound read loop throwing.
+ *   8. a stream that fails *after* a successful dial - the relay accepted the stream but the target
+ *      refused or dropped it - ends the socket the same way, as does the connected-stream setup
+ *      throwing and the socket's own outbound read loop throwing;
+ *   9. a close nobody is sorry about stays quiet: the client hanging up, and a stream that simply
+ *      ends, give exactly one close event and no error (a clean end-of-stream used to be reported as
+ *      an error, and close() used to send no event at all).
  *
  * The classes and the gate block are cut out of the shipped wispcraft.js, so this drives the code the
  * browser runs rather than a copy of it. Run with: node --test
@@ -98,6 +101,8 @@ function makeCtx() {
   ctx.SA = Promise.resolve();
   ctx.yA = null;
   ctx.jaDelay = 0;
+  /* a stream this test settles later, so the socket can be closed while its loops are still reading */
+  ctx.streamLater = false;
   ctx.JA = (w) => { log.push("init:" + w); setTimeout(() => ctx.yA && ctx.yA(w), ctx.jaDelay); };
   ctx.KA = {
     replace_stream_provider: async () => { log.push("replace_stream_provider"); },
@@ -112,11 +117,18 @@ function makeCtx() {
       /* the relay accepted the stream; what happens behind it decides whether the join lives */
       /* the bundle calls getReader(), wraps the reader, then calls getReader() again on the result */
       const reader = (read) => ({ read, getReader() { return this; } });
+      const later = ctx.streamLater
+        ? new Promise((res, rej) => {
+            ctx.settleStream = (how) => (how === "end" ? res({ done: true }) : rej(new Error("stream reset by relay (code 1006)")));
+          })
+        : null;
       const leaf = ctx.streamFails
         ? { getReader: () => reader(() => Promise.reject(new Error("stream reset by relay (code 1006)"))) }
         : ctx.streamEnds
           ? { getReader: () => reader(() => Promise.resolve({ done: true })) }
-          : NEVER;
+          : later
+            ? { getReader: () => reader(() => later) }
+            : NEVER;
       return {
         write: { getWriter: () => ({ write: () => Promise.resolve() }) },
         read: { pipeThrough: () => ({ pipeThrough: () => ({ pipeThrough: () => ({ pipeThrough: () => leaf }) }) }) },
@@ -263,7 +275,6 @@ test("java stream: a ping is not probed, a join is, and a failed dial closes the
      socket that stayed at open with no error and no close. */
   for (const [name, setup, why] of [
     ["a stream that errors after a successful dial", (c) => { c.streamFails = true; }, /stream reset by relay/],
-    ["a stream that ends after a successful dial", (c) => { c.streamEnds = true; }, /stream error/],
     ["the connected-stream setup throwing", (c) => { c.implThrows = true; }, /epoxyclientoptions_new_default/],
     ["the socket's own outbound read throwing", (c) => { c.outReadFails = true; }, /eaglerOut read failed/],
   ]) {
@@ -290,6 +301,69 @@ test("java stream: a ping is not probed, a join is, and a failed dial closes the
       ctx.notes.some((n) => /java stream failed after connect/.test(n) && why.test(n)), ctx.notes.join(" | ") || "no notes");
     check(`${name} leaves no unhandled rejection`, unhandled.length === 0, unhandled.join(" | "));
     check(`${name} releases the connect gate`, ctx.connects === 0 && ctx.log.includes("leave"), ctx.log.join(" "));
+  }
+
+  /* 9. a close nobody is sorry about. A stream that ENDS is the ordinary end of a session, not a
+     failure: it used to go through patch 10's reporter and reach the game as `error` then `close`.
+     It is now one quiet close, with no failure note. */
+  {
+    const ctx = makeCtx();
+    ctx.streamEnds = true;
+    const events = [];
+    const ws = new ctx.__VI("java://java://geo.test.example:25565");
+    ["open", "error", "close"].forEach((t) => ws.addEventListener(t, () => events.push(t)));
+    ws.start();
+    ws.send(new Uint8Array([6, 0, 4, 9, 1, 2, 3]).buffer);
+    await sleep(300);
+    check("a clean end-of-stream ends the socket with one close and no error",
+      events.join(",") === "open,close", events.join(",") || "no events");
+    check("the clean end leaves the socket closed", ws.readyState === 3, String(ws.readyState));
+    check("a clean end is not reported as a stream failure",
+      !ctx.notes.some((n) => /java stream failed after connect/.test(n)), ctx.notes.join(" | ") || "no notes");
+    check("the clean end releases the connect gate", ctx.connects === 0 && ctx.log.includes("leave"), ctx.log.join(" "));
+  }
+
+  /* and a client-initiated close sends the close event the game is waiting for - it used to send none
+     at all - while the read loops that are still running wind up without a second event or a note. */
+  for (const [name, settle] of [
+    ["the client closing a join it had opened", "reject"],
+    ["the client closing before its read loops end", "end"],
+  ]) {
+    const ctx = makeCtx();
+    ctx.streamLater = true;
+    const events = [];
+    const unhandled = [];
+    const onUnhandled = (e) => unhandled.push(String((e && e.message) || e));
+    let ws;
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      ws = new ctx.__VI("java://java://geo.test.example:25565");
+      ["open", "error", "close"].forEach((t) => ws.addEventListener(t, () => events.push(t)));
+      ws.start();
+      ws.send(new Uint8Array([6, 0, 4, 9, 1, 2, 3]).buffer);
+      await sleep(200);
+      check(`${name}: the join is open before the close`,
+        ws.readyState === 1 && events.join(",") === "open", events.join(",") || "no events");
+      ws.close();
+      await sleep(100);
+      /* the loops are still reading; the stream settles only after the socket was closed */
+      ctx.settleStream(settle);
+      await sleep(200);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    check(`${name} sends exactly one close and no error`,
+      events.join(",") === "open,close", events.join(",") || "no events");
+    check(`${name} leaves the socket closed`, ws.readyState === 3, String(ws.readyState));
+    check(`${name} reports nothing as a stream failure`,
+      !ctx.notes.some((n) => /java stream failed after connect|relay dial failed/.test(n)),
+      ctx.notes.join(" | ") || "no notes");
+    check(`${name} leaves no unhandled rejection`, unhandled.length === 0, unhandled.join(" | "));
+    check(`${name} releases the connect gate`, ctx.connects === 0 && ctx.log.includes("leave"), ctx.log.join(" "));
+    /* a second close is still not an event: a real socket reports the close once */
+    ws.close();
+    await sleep(50);
+    check(`${name} does not close twice`, events.filter((t) => t === "close").length === 1, events.join(","));
   }
 
   /* 4.-6. the switch gate, running patch 8's own code */

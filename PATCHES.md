@@ -468,6 +468,20 @@ Three things had to change for that check to be worth anything:
    repeated). Both view loops had to be covered, because the relay's side of the stream and the
    client's own side fail independently. `test/java-stream.test.mjs` drives all four paths on the
    shipped classes and also asserts that none of them leaves an unhandled rejection behind.
+   Not every ending is a failure, and patch 11 draws that line. A stream that simply **ends** - the
+   relay or the server closing its side, which is what the ordinary end of a session and a target the
+   relay cannot reach both look like - is no longer reported as an error: it is one `close`, with no
+   failure note, exactly as before patch 10 for a socket that had never opened. And the game's own
+   `close()` used to send no event at all (it only flipped `readyState`, so a client waiting for the
+   close event never got one); it now sends that one `close` too. Both paths mark the socket quiet
+   first, so the read loops that are still running wind up without a second event or a note, and a
+   socket that is already closed is never closed again. Only a stream that *throws* keeps the
+   `error` then `close` ending, which is what patch 10 exists for. Measured on the shipped bundle in
+   Chromium through `wss://truffled.lol/wisp/` with `java://127.0.0.1:9` (a target the relay accepts
+   the stream for and then cannot reach): `open@3 ms, close@171 ms`, no `error`, no note, readyState
+   3 - previously `open, error@175, close@175` plus the failure note. A reachable target closed from
+   the page (`java://geo.minemen.club:25565`, `close()` at 5 s) gives `open@3 ms, close@5008 ms`, also
+   with no error and no note.
    The page does not probe at boot either: the earlier version probed the first repaired entry on
    every visit (its `pairs` reference was undefined, so it threw into the repair catch) and its
    fallback opened eight sockets at third-party relays in parallel.

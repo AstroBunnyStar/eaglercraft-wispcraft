@@ -199,9 +199,9 @@ test("relay failover: sequential sweep, a refused switch, and the join-only chec
       (body.match(/__releaseConnects\(\)/g) || []).length >= 2, `${(body.match(/__releaseConnects\(\)/g) || []).length} releases`);
 
     /* the java stream: open first, dial only once the first frame says ping or join */
-    const fwd = js.indexOf("async forward(A,__onFail){");
+    const fwd = js.indexOf("async forward(A,__onFail,__onDone){");
     const fwdBody = fwd < 0 ? "" : js.slice(fwd, fwd + 2600);
-    check("the java stream dispatches open before it dials", /async forward\(A,__onFail\)\{var __open=A;queueMicrotask\(/.test(js), "");
+    check("the java stream dispatches open before it dials", /async forward\(A,__onFail,__onDone\)\{var __open=A;queueMicrotask\(/.test(js), "");
     check("open is delivered asynchronously, like a real socket", /queueMicrotask\(function\(\)\{try\{__open\(\)/.test(js), "");
     check("the dial is bounded by a timeout", /wispcraftDialTimeout/.test(fwdBody) && /Promise.race/.test(fwdBody), "");
     check("the frame wait is bounded too", /wispcraftFrameTimeout/.test(fwdBody), "");
@@ -211,7 +211,18 @@ test("relay failover: sequential sweep, a refused switch, and the join-only chec
     const failBody = failAt < 0 ? "" : js.slice(failAt, failAt + 320);
     check("that failure ends in error then close, not a silent open",
       failBody.indexOf('Event("error")') > 0 && failBody.indexOf('Event("error")') < failBody.indexOf('Event("close")'), failBody.slice(0, 60));
-    check("start() passes the failure callback to forward", /\.forward\(\(\)=>\{[^;]*\},\(\)=>this\.__fail\(\)\)/.test(js), "");
+    const quietAt = js.indexOf("__quietClose(){");
+    const quietBody = quietAt < 0 ? "" : js.slice(quietAt, quietAt + 320);
+    check("the quiet close sends close only, once",
+      quietAt > 0 && quietBody.indexOf('Event("error")') < 0 && quietBody.indexOf('CloseEvent("close")') > 0 &&
+        quietBody.indexOf("WebSocket.CLOSED||this.readyState===WebSocket.CLOSING") > 0, quietBody.slice(0, 60));
+    check("start() passes the failure callback to forward", /\.forward\(\(\)=>\{[^;]*\},\(\)=>this\.__fail\(\)/.test(js), "");
+    /* a close nobody is sorry about: the client's own close, and a clean end of stream */
+    check("start() also passes the quiet-close callback", /\.forward\(\(\)=>\{[^;]*\},\(\)=>this\.__fail\(\),\(\)=>this\.__quietClose\(\)\)/.test(js), "");
+    check("a clean end of stream is reported as a quiet close",
+      !/void __sf\(\)/.test(js) && (js.match(/void __done\(\)/g) || []).length === 2,
+      `${(js.match(/void __done\(\)/g) || []).length} quiet ends`);
+    check("close() sends the event a real socket sends", /close\(\)\{this\.__quietClose\(\)\}/.test(js), "");
     check("the first frame classifies the socket",
       /send\(A\)\{var __f=typeof A==="string"&&"accept: motd"===A\.toLowerCase\(\)\?"motd":"data"/.test(js), "");
     check("the dial waits for that first frame",

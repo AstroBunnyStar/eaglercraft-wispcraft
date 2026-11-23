@@ -522,6 +522,69 @@ if (js.includes(STREAM_MARKER)) {
   lines.push("[fix]  post-connect stream failures end the socket with error then close");
 }
 
+// ---------------------------------------------------------------- patch 11: an orderly close stays orderly
+// Patch 10 made every stream failure an `error` then `close`, which is right for a failure and wrong
+// for a close nobody is sorry about. Two cases are not failures, and both were noisy:
+//   * `close()` - the game hanging up - only flipped readyState, so no `close` event was ever sent.
+//     A real socket always sends one, and the client waits for it to leave the world/server.
+//   * a stream that simply ENDS - the relay or the server closing its side, the ordinary end of a
+//     session - went through patch 10's reporter, so a normal disconnect reached the game as an
+//     `error` before the `close` (observed live as the failure note, "stream error", for a target the
+//     relay could not reach at all).
+// Both now take one quiet close: no `error`, one `close`, no failure note. The loops that are still
+// running are told to wind up silently (__wispQuiet), so a second ending cannot add a note or a
+// second close, and a socket that was already closed is never closed again.
+const QUIET_MARKER = "__quietClose()";
+const FWD_SIG_ANCHOR = "async forward(A,__onFail){";
+const FAIL_SRC_ANCHOR =
+  'var __sf=function(e){window.wispcraftNote&&window.wispcraftNote("java stream failed after connect: "+' +
+  'String((e&&(e.message||e))||"stream error"));__onFail&&__onFail(e)};try{';
+const DONE_BRANCH = "if(g||!C)return void __sf();";
+const START_CB_ANCHOR = ",()=>this.__fail())";
+const OUT_CATCH_ANCHOR = "catch(A){console.error(A),this.__fail()}})()}";
+const CLOSE_BODY_ANCHOR =
+  "close(){if(this.readyState!=WebSocket.CLOSING&&this.readyState!=WebSocket.CLOSED){" +
+  "this.readyState=WebSocket.CLOSING;try{this.inner.eaglerIn.abort()}catch(A){}this.readyState=WebSocket.CLOSED}}";
+
+const quietAnchors = [FWD_SIG_ANCHOR, FAIL_SRC_ANCHOR, START_CB_ANCHOR, OUT_CATCH_ANCHOR, CLOSE_BODY_ANCHOR];
+if (js.includes(QUIET_MARKER)) {
+  lines.push("[ok]   quiet close already present");
+} else if (
+  !js.includes(STREAM_MARKER) ||
+  js.split(DONE_BRANCH).length - 1 !== 2 ||
+  !quietAnchors.every((a) => js.split(a).length - 1 === 1)
+) {
+  lines.push("[skip] quiet close: the failed-close text or one of its anchors was not found once");
+} else {
+  /* the clean end of a loop reports a done close, and the failure reporter goes quiet once the
+     socket has been closed on purpose */
+  js = js.replace(FWD_SIG_ANCHOR, "async forward(A,__onFail,__onDone){");
+  js = js.replace(
+    FAIL_SRC_ANCHOR,
+    "var __done=function(){__self.__wispQuiet=1,__onDone&&__onDone()}," +
+      "__sf=function(e){if(__self.__wispQuiet)return;" +
+      'window.wispcraftNote&&window.wispcraftNote("java stream failed after connect: "+' +
+      'String((e&&(e.message||e))||"stream error")),__onFail&&__onFail(e)};try{'
+  );
+  js = js.split(DONE_BRANCH).join("if(g||!C)return void __done();");
+  js = js.replace(START_CB_ANCHOR, ",()=>this.__fail(),()=>this.__quietClose())");
+  /* a close that has already happened is not re-reported on the console either */
+  js = js.replace(
+    OUT_CATCH_ANCHOR,
+    "catch(A){this.readyState!==WebSocket.CLOSED&&console.error(A),this.__fail()}})()}"
+  );
+  js = js.replace(
+    CLOSE_BODY_ANCHOR,
+    "__quietClose(){if(this.readyState===WebSocket.CLOSED||this.readyState===WebSocket.CLOSING)return;" +
+      "this.readyState=WebSocket.CLOSING;this.inner.__wispQuiet=1;" +
+      "try{this.inner.eaglerIn.abort()}catch(e){}" +
+      'this.readyState=WebSocket.CLOSED;try{this.dispatchEvent(new CloseEvent("close"))}catch(e){}}' +
+      "close(){this.__quietClose()}"
+  );
+  changed++;
+  lines.push("[fix]  a close the client asks for, and a clean end of stream, send one close and no error");
+}
+
 // ---------------------------------------------------------------- validate before writing
 if (!fatal && changed) {
   const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "wispcraft-patch-")), "check.js");
