@@ -135,7 +135,14 @@ function makeCtx() {
       };
     },
   };
+  ctx.srvAnswer = undefined;
   ctx.window = {
+    /* the launcher's resolver hands back the record's target as a string - "geo.minemen.club", or
+       "host:port" for a non-default port - so the harness answers in that same shape */
+    wispcraftResolveSrv: (h) => {
+      log.push("srv:" + h);
+      return Promise.resolve(ctx.srvAnswer);
+    },
     wispcraftEnsureRelayReaches: (h, p) => {
       log.push("reach:" + h + ":" + p);
       ctx.reach.push(h + ":" + p);
@@ -373,6 +380,34 @@ test("java stream: a ping is not probed, a join is, and a failed dial closes the
     ws.close();
     await sleep(50);
     check(`${name} does not close twice`, events.filter((t) => t === "close").length === 1, events.join(","));
+  }
+
+  /* 3b. the srv target is what the join dials. The launcher's resolver returns a string, and the
+     first version of the srv hook only understood {host, port}, so the answer was dropped and the
+     join dialled the apex name - minemen.club:25565, which no relay can reach. */
+  for (const [name, answer, dialed, reached] of [
+    ["a bare host", "geo.minemen.club", "geo.minemen.club:25565", "geo.minemen.club:25565"],
+    ["a host with its own port", "geo.minemen.club:25566", "geo.minemen.club:25566", "geo.minemen.club:25566"],
+  ]) {
+    const ctx = makeCtx();
+    ctx.srvAnswer = answer;
+    const ws = new ctx.__VI("java://java://minemen.club");
+    const events = [];
+    ["open", "error", "close"].forEach((t) => ws.addEventListener(t, () => events.push(t)));
+    ws.start();
+    await sleep(10);
+    ws.send(new Uint8Array([6, 0, 4, 9, 1, 2, 3]).buffer);
+    await sleep(300);
+    check(`the join (${name}) asks the page resolver for the apex record`, ctx.log.includes("srv:minemen.club"), ctx.log.join(" "));
+    check(`the join (${name}) dials the resolved target`, ctx.log.includes("connect_tcp:" + dialed), ctx.log.join(" "));
+    check(`the join (${name}) never dials the apex name`,
+      !ctx.log.some((l) => l === "connect_tcp:minemen.club:25565") && !ctx.log.some((l) => l === "connect_tcp:minemen.club"),
+      ctx.log.join(" "));
+    check(`the reach check (${name}) asks about the resolved target`, ctx.reach[0] === reached, ctx.reach.join(" ") || "none");
+    check(`the log (${name}) names the srv answer once`,
+      ctx.notes.filter((n) => n === `srv minemen.club -> ${dialed}`).length === 1, ctx.notes.join(" | ") || "no notes");
+    check(`the join (${name}) is open and dialed once`, ws.readyState === 1 && events.join(",") === "open" && ctx.connectSeq === 1,
+      `${events.join(",")} / ${ctx.connectSeq} dials`);
   }
 
   /* 4.-6. the switch gate, running patch 8's own code */

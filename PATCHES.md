@@ -389,6 +389,16 @@ Three separate things had to line up, and each one was measured before it was be
    with a fetch through its own epoxy client, so a dead multiplexor silently downgraded the dial to
    the bare domain and the relay answered `Wisp destination connection timed out (code 1006)`. It now
    asks `window.wispcraftResolveSrv` first and keeps the upstream lookup as a fallback.
+   That covers the sockets the bundle creates, but not the one a join actually uses. Measured in
+   `play.html`, the client's wisp socket comes from its own reference to the native `WebSocket`:
+   replacing `window.WebSocket` saw no socket at all during a join, while every frame still passes
+   through `WebSocket.prototype.send`, and the bundle's `java://` stream class was never entered. So
+   the page owns the same step for the real path - `send()` recognises the wisp CONNECT a join opens
+   with (`01 [stream] [tcp] [port] "host"`), holds that one frame for the `_minecraft._tcp` answer,
+   and puts the record's target on the wire before the frames queued behind it; a lookup that has not
+   answered in 2.5 s releases the frame unchanged. Measured in the client: joining `minemen.club`
+   logs `[wispcraft] srv minemen.club -> geo.minemen.club` and reaches Minemen's login stage, which
+   then reports that the server requires a Microsoft-authenticated account.
 2. **Transport** (patches 5 and 6). Quick Play hands the host to the client as a plain address, and
    the client dials `wss://<host>` - an EaglerX socket no Java server answers ("connection dropped
    without a WebSocket close frame (code 1006)"). The game's networking runs in a wasm worker, so a

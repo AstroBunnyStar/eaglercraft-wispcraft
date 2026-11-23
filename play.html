@@ -646,6 +646,80 @@
      socket into a Wisp socket for this one server, and the SRV record is applied first so the relay
      is handed the address the server actually listens on (minemen.club -> geo.minemen.club:25565). */
   window.wispcraftNote = function (msg) { try { console.log("[wispcraft] " + msg); } catch (e) {} };
+  /* The client's wisp socket keeps its own reference to the native WebSocket, so replacing
+     window.WebSocket never sees it; the shared prototype does. A join's first frame on that socket is
+     the wisp CONNECT naming the server, and for a host whose _minecraft._tcp record points somewhere
+     else that name is what no relay can reach (minemen.club:25565 times out; the record's
+     geo.minemen.club:25565 answers in about 100 ms). The CONNECT is held for the record and sent to
+     its target instead; the frames the client queues behind it go out, in order, once it has gone. */
+  (function () {
+    var proto = window.WebSocket && window.WebSocket.prototype;
+    if (!proto || proto.__wispcraftSrv) return;
+    proto.__wispcraftSrv = 1;
+    var nativeSend = proto.send;
+    /* wisp CONNECT: [0x01][streamID u32 LE][streamType 0x01 TCP][port u16 LE][hostname utf8] */
+    function connectOf(u8) {
+      if (!u8 || u8.length < 12 || u8[0] !== 1 || u8[5] !== 1) return null;
+      var host = "";
+      for (var i = 8; i < u8.length; i++) {
+        var c = u8[i];
+        if (!c) break;
+        host += String.fromCharCode(c);
+      }
+      if (host.indexOf(".") < 0 || !/^[a-z0-9][a-z0-9.-]*$/i.test(host)) return null;
+      return { host: host.toLowerCase(), port: u8[6] | (u8[7] << 8), bytes: u8 };
+    }
+    function rewrite(info, target) {
+      var colon = target.lastIndexOf(":"), host = target, port = 0;
+      if (colon > 0) { host = target.slice(0, colon); port = parseInt(target.slice(colon + 1), 10) || 0; }
+      var out = new Uint8Array(8 + host.length);
+      out.set(info.bytes.subarray(0, 8), 0);
+      port = port || info.port;
+      out[6] = port & 0xff;
+      out[7] = (port >> 8) & 0xff;
+      for (var i = 0; i < host.length; i++) out[8 + i] = host.charCodeAt(i) & 0xff;
+      return out;
+    }
+    function flush(socket, first) {
+      var queue = socket.__wispQueue || [];
+      socket.__wispQueue = null;
+      if (first) nativeSend.call(socket, first);
+      for (var i = 0; i < queue.length; i++) nativeSend.call(socket, queue[i]);
+    }
+    proto.send = function (data) {
+      var u8 = null;
+      try {
+        if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+        else if (data && data.buffer instanceof ArrayBuffer) u8 = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+      } catch (e) {}
+      var info = connectOf(u8);
+      if (!info) {
+        /* nothing goes out ahead of a CONNECT that is still waiting for its record */
+        if (this.__wispQueue) { this.__wispQueue.push(data); return; }
+        return nativeSend.apply(this, arguments);
+      }
+      if (this.__wispQueue) { this.__wispQueue.push(data); return; }
+      var socket = this, sent = false;
+      function go(frame) {
+        if (sent) return;
+        sent = true;
+        clearTimeout(timer);
+        flush(socket, frame);
+      }
+      /* a DNS answer that never comes must not leave the join parked: after 2.5 s the frame goes out
+         exactly as the client wrote it, which is the behaviour before this hook */
+      var timer = setTimeout(function () { go(data); }, 2500);
+      socket.__wispQueue = [];
+      resolveSrv(info.host).then(function (target) {
+        if (target && target !== info.host) {
+          try { window.wispcraftNote && window.wispcraftNote("srv " + info.host + " -> " + target); } catch (e) {}
+          go(rewrite(info, target));
+        } else {
+          go(data);
+        }
+      }, function () { go(data); });
+    };
+  })();
   function parseJavaTarget(raw) {
     var text = String(raw == null ? "" : raw).trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
     if (!text || text.indexOf("/") > -1 || text.indexOf("?") > -1) return null;

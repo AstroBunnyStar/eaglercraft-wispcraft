@@ -236,21 +236,40 @@ if (js.includes('.' + RELAY_REPAIR + '=')) {
 // swallows it and the relay is asked for the bare host (minemen.club times out; geo.minemen.club is
 // the real target). The launcher page owns a two-provider resolver with a 6 hour cache, so prefer it
 // and keep the upstream lookup as the fallback.
-const SRV_MARKER = 'window.wispcraftResolveSrv=="function"';
+// The answer shape matters: the launcher's resolver returns the record's target as a string
+// (`"geo.minemen.club"`, or `"host:port"` for a non-default port), which is also what it has always
+// returned. The first version of this patch only understood `{host, port}`, so it dropped the answer
+// and the join still dialled minemen.club - the apex name, which no relay can reach. Both shapes are
+// accepted now, and a bare host gets the default 25565 so the dial has a port to work with.
+/* the `{host, port}` form is normalised to the string the launcher returns, and this exact line is
+   also the marker for "the string form is understood" when --check inspects a bundle */
+const SRV_SHAPE = 'if(__srv&&typeof __srv=="object")__srv=String(__srv.host||"")+(__srv.port?":"+__srv.port:"");';
+const SRV_MARKER = '" -> "+__srv)';
 const SRV_ANCHOR = "async forward(A){let I;try{";
+/* the {host,port}-only form this patch shipped first: an upgraded bundle carries it in place, so it
+   is replaced rather than left alone (and not mistaken for "already present") */
+const SRV_OLD_SRC =
+  'if(typeof window.wispcraftResolveSrv=="function"){try{var __srv=await window.wispcraftResolveSrv(this.url.hostname);' +
+  'if(__srv&&__srv.host){I=new URL("java://"+__srv.host+":"+(__srv.port||25565)),' +
+  'window.wispcraftNote&&window.wispcraftNote("srv "+this.url.hostname+" -> "+__srv.host+":"+(__srv.port||25565))}}catch(e){}}';
+const srvSrc =
+  "if(typeof window.wispcraftResolveSrv==\"function\"){try{var __srv=await window.wispcraftResolveSrv(this.url.hostname);" +
+  SRV_SHAPE +
+  "if(__srv){__srv.indexOf(\":\")<0&&(__srv+=\":25565\"),I=new URL(\"java://\"+__srv)," +
+  "window.wispcraftNote&&window.wispcraftNote(\"srv \"+this.url.hostname+\" -> \"+__srv)}}catch(e){}}";
 
-if (js.includes(SRV_MARKER)) {
+if (js.includes(SRV_MARKER) && js.includes(SRV_SHAPE)) {
   lines.push("[ok]   srv resolution patch already present");
+} else if (js.includes(SRV_OLD_SRC)) {
+  js = js.split(SRV_OLD_SRC).join(srvSrc);
+  changed++;
+  lines.push("[fix]  srv resolution accepts the resolver's string target (upgraded the {host,port}-only form)");
 } else if (!js.includes(SRV_ANCHOR)) {
   lines.push("[skip] srv resolution: the java forward() anchor was not found");
 } else {
-  const srvSrc =
-    "if(typeof window.wispcraftResolveSrv==\"function\"){try{var __srv=await window.wispcraftResolveSrv(this.url.hostname);" +
-    "if(__srv&&__srv.host){I=new URL(\"java://\"+__srv.host+\":\"+(__srv.port||25565))," +
-    "window.wispcraftNote&&window.wispcraftNote(\"srv \"+this.url.hostname+\" -> \"+__srv.host+\":\"+(__srv.port||25565))}}catch(e){}}";
   js = js.replace(SRV_ANCHOR, SRV_ANCHOR + srvSrc);
   changed++;
-  lines.push("[fix]  srv resolution routed through window.wispcraftResolveSrv");
+  lines.push("[fix]  srv resolution routed through window.wispcraftResolveSrv, string target accepted");
 }
 
 // ---------------------------------------------------------------- patch 5: quick play opens in Wisp mode

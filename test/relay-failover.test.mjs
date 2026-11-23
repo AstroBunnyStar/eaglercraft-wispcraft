@@ -232,6 +232,9 @@ test("relay failover: sequential sweep, a refused switch, and the join-only chec
     check("close() sends the event a real socket sends", /close\(\)\{this\.__quietClose\(\)\}/.test(js), "");
     check("the first frame classifies the socket",
       /send\(A\)\{var __f=typeof A==="string"&&"accept: motd"===A\.toLowerCase\(\)\?"motd":"data"/.test(js), "");
+    /* the page resolver returns the record target as a string; the join must dial it, not the apex */
+    check("the srv answer becomes the dial target, string form included",
+      /__srv&&typeof __srv=="object"/.test(js) && /srv "\+this\.url\.hostname\+" -> "\+__srv/.test(js), "");
     check("the dial waits for that first frame",
       fwdBody.includes("__wispDialIntent") && fwdBody.includes("void 0===__self.__frame){await new Promise"), "");
     const reachAt = fwdBody.indexOf("window.wispcraftEnsureRelayReaches(__h,__p)");
