@@ -15,6 +15,11 @@ node tools/patch-wispcraft.mjs --check     # 1 = patch missing, 0 = good, 2 = bu
 node tools/patch-wispcraft.mjs             # applies whatever is missing (idempotent)
 node tools/patch-wispcraft.mjs --file path/to/other-copy.js
 node tools/patch-wispcraft.mjs --default-relay wss://relay.example/
+
+# after rebuilding play.html (the page-level SRV hook is a local edit, not part of the payload)
+node tools/patch-play-srv-hook.mjs --check    # 1 = hook missing or stale, 0 = good, 2 = anchor gone
+node tools/patch-play-srv-hook.mjs            # inserts it, or replaces an older copy (idempotent)
+node tools/patch-play-srv-hook.mjs --file path/to/other-play.html
 ```
 
 Then re-check the client still boots (launcher → Play, sign-in code appears). The script refuses
@@ -398,7 +403,16 @@ Three separate things had to line up, and each one was measured before it was be
    and puts the record's target on the wire before the frames queued behind it; a lookup that has not
    answered in 2.5 s releases the frame unchanged. Measured in the client: joining `minemen.club`
    logs `[wispcraft] srv minemen.club -> geo.minemen.club` and reaches Minemen's login stage, which
-   then reports that the server requires a Microsoft-authenticated account.
+   then reports that the server requires a Microsoft-authenticated account. Two more servers confirm
+   it is the record and not that one server: `blocksmc.com` -> `ccc.blocksmc.com` joins all the way
+   into the world, and `pika-network.net` -> `pika-network_net.pika.host` reaches Pika's own login
+   denial (its egress IP rule), both with the same one-line log note.
+
+   Because the hook lives in the page - which is a rebuilt artifact - it is re-applied the same way
+   the bundle patches are: `tools/patch-play-srv-hook.mjs` holds the hook text, inserts it after the
+   `window.wispcraftNote` line, replaces an older copy, and `--check` fails if a rebuild dropped it
+   or left a different version. `test/play-srv-hook.test.mjs` drives the shipped page's hook and also
+   runs that `--check`, so a rebuild that loses the hook fails a test instead of a join.
 2. **Transport** (patches 5 and 6). Quick Play hands the host to the client as a plain address, and
    the client dials `wss://<host>` - an EaglerX socket no Java server answers ("connection dropped
    without a WebSocket close frame (code 1006)"). The game's networking runs in a wasm worker, so a
