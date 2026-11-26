@@ -2,7 +2,7 @@ name: verify
 
 on:
   push:
-    branches: [main]
+    branches: [main, single-file]
   pull_request:
   workflow_dispatch:
 
@@ -10,20 +10,16 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  # One runtime, one checkout: these read the pages themselves, so they say the same thing on every
+  # Node version and there is no reason to pay for the 80 MB single-file checkout three times.
+  page:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # the test command has to work on every supported Node: `node --test <dir>` was
-        # rejected on 24, so discovery stays argument-free
-        node: ["20", "22", "24"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: "22"
 
       - name: Scripts parse
         run: |
@@ -36,17 +32,42 @@ jobs:
           node --check tools/verify-published.mjs
           node --check tools/probe-relay.mjs
           node --check tools/walk-picker.mjs
+          node --check tools/patch-play-srv-hook.mjs
 
-      - name: Launcher inline script parses
-        run: node tools/check-launcher.mjs
+      # index.html is the launcher and play.html is what it hands the tab to; the single-file build
+      # only differs by being one file, so the shim and the boot gate are checked in both
+      - name: Launcher and client inline scripts parse
+        run: |
+          set -euo pipefail
+          node tools/check-launcher.mjs
+          node tools/check-launcher.mjs play.html
 
       # the assumptions the browser walk (tools/walk-picker.mjs) relies on: picker ids, the four
       # notes, the row shape, and the one database the launcher writes and the client reads
       - name: Launcher pick matches its walk
         run: node tools/walk-picker.mjs --check
 
-      - name: Tests
-        run: node --test
-
       - name: Bundle default matches index.html
         run: node tools/patch-wispcraft.mjs --check
+
+      # a rebuilt page silently drops this local edit, and a join then times out at the relay
+      - name: The page carries the join srv hook
+        run: node tools/patch-play-srv-hook.mjs --check
+
+  # The suite is the part that follows the runtime: it runs on every Node the client claims to
+  # support, and `node --test` has to stay argument-free (Node 24 rejects a directory argument).
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Tests
+        run: node --test

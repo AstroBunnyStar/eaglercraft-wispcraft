@@ -21,10 +21,23 @@ if (typeof WebSocket !== "function") {
   process.exit(2);
 }
 
+/* Everything the launcher is allowed to touch. A vm context inherits no Node globals, so this list
+   is the launcher's whole world: a page edit that reaches for one more (TextEncoder, crypto,
+   AbortController, performance) would otherwise throw here and nowhere else, which reads as a relay
+   fault rather than a probe that fell behind the page. Grow it when the launcher grows. */
+const GLOBALS = [
+  "URL", "URLSearchParams", "atob", "btoa", "TextEncoder", "TextDecoder",
+  "Uint8Array", "Uint16Array", "Uint32Array", "Int8Array", "ArrayBuffer", "DataView",
+  "Promise", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "queueMicrotask",
+  "performance", "crypto", "AbortController", "AbortSignal", "WebSocket", "console",
+];
+
 /** the page assigns window.WispRelays; nothing it defines runs until it is called. */
 function launcher() {
-  /* atob decodes the captured ClientHello; a vm context does not inherit Node's globals */
-  const context = { window: {}, URL, atob, Uint8Array, Promise, setTimeout, clearTimeout, WebSocket };
+  const context = { window: {} };
+  for (const name of GLOBALS) {
+    if (typeof globalThis[name] !== "undefined") context[name] = globalThis[name];
+  }
   vm.createContext(context);
   vm.runInContext(relaySource(), context, { filename: "index.html" });
   return context.window.WispRelays;

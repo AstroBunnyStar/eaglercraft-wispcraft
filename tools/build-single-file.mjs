@@ -66,7 +66,10 @@ const SHIM = `<script type="text/javascript">
     var encoded = node.textContent;
     node.textContent = ""; /* drop the base64 before the bytes double it */
     node.remove();
-    var out = new Uint8Array(size);
+    /* one part per base64 line, handed straight to the Blob: an 80 MB payload is a few hundred
+       lines, so the page never allocates a single contiguous buffer of the decoded size on top of
+       the base64 string it was just read from - that pair is what a phone runs out of memory on */
+    var parts = [];
     var offset = 0;
     var start = 0;
     while (start < encoded.length) {
@@ -76,22 +79,34 @@ const SHIM = `<script type="text/javascript">
       if (end < 0) end = encoded.length;
       while (end > start && encoded.charCodeAt(end - 1) <= 32) --end;
       var binary = atob(encoded.slice(start, end));
-      for (var i = 0; i < binary.length; ++i) out[offset + i] = binary.charCodeAt(i);
+      var part = new Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; ++i) part[i] = binary.charCodeAt(i);
+      parts.push(part);
       offset += binary.length;
-      binary = "";
       start = end + 1;
     }
     encoded = "";
     if (offset !== size) throw new Error("single-file payload size mismatch: " + id + " (" + offset + " != " + size + ")");
-    var blob = new Blob([out], { type: "application/octet-stream" });
-    out = null;
+    var blob = new Blob(parts, { type: "application/octet-stream" });
+    parts = null;
     return URL.createObjectURL(blob);
   }
 
   window.__eaglerSingleFileURL = function (url) {
     var name = String(url).split("?")[0].split("#")[0].split("/").pop();
     if (!ids[name]) return null;
-    if (!urls[name]) urls[name] = decode(ids[name]);
+    if (urls[name]) return urls[name];
+    try {
+      urls[name] = decode(ids[name]);
+    } catch (e) {
+      /* nothing else in this page can report a payload fault: the client only sees a request that
+         never finished. Keep the real reason where it can be read, then let the request fail here
+         instead of falling through to a network fetch for a file that does not exist. */
+      var why = "single-file payload " + name + " failed: " + ((e && e.message) || e);
+      window.__eaglerSingleFileError = why;
+      try { console.error(why); } catch (e2) {}
+      throw new Error(why);
+    }
     return urls[name];
   };
 
@@ -99,8 +114,7 @@ const SHIM = `<script type="text/javascript">
   if (!XHR || !XHR.prototype || !XHR.prototype.open) return;
   var open = XHR.prototype.open;
   XHR.prototype.open = function (method, url) {
-    var inline = null;
-    try { inline = window.__eaglerSingleFileURL(url); } catch (e) { inline = null; }
+    var inline = window.__eaglerSingleFileURL(url);
     var args = Array.prototype.slice.call(arguments);
     if (inline) args[1] = inline;
     return open.apply(this, args);

@@ -34,6 +34,8 @@
   .foot{display:flex;align-items:center;justify-content:space-between;gap:8px;
     margin:10px 0 0;font-size:.7rem;color:#5d6d57}
   .foot .say{min-height:1em;flex:1;text-align:left}
+  .foot .offline{color:#7fe04a;font-size:.7rem;white-space:nowrap;text-decoration:none}
+  .foot .offline:hover{text-decoration:underline}
   /* </picker-style> */
 </style>
 </head>
@@ -56,6 +58,9 @@
     <div class="foot">
       <span class="say" id="picksay"></span>
       <button id="plain" type="button">Play without a server</button>
+      <a class="offline"
+         href="https://github.com/AstroBunnyStar/eaglercraft-wispcraft/releases/latest/download/eaglercraft.html"
+         title="Download the one-file client and play without this site">Play offline</a>
     </div>
   </div>
   <!-- </picker> -->

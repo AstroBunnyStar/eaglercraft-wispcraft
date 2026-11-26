@@ -77,3 +77,10 @@ jobs:
             || gh release create "$tag" --title "Single-file client" --notes "$body"
           gh release edit "$tag" --notes "$body"
           gh release upload "$tag" eaglercraft.html --clobber
+
+          # gh exits 0 on a short upload, and 80 MB is the step most likely to arrive truncated: read
+          # the stored size back and fail the build unless it is the page that was just checked
+          want=$(stat -c%s eaglercraft.html)
+          got=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[] | select(.name == "eaglercraft.html") | .size')
+          echo "stored $got bytes of $want"
+          test "$got" = "$want"

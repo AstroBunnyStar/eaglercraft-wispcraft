@@ -35,7 +35,13 @@ import { execFileSync } from "node:child_process";
 const ANCHOR = 'window.wispcraftNote = function (msg) { try { console.log("[wispcraft] " + msg); } catch (e) {} };';
 /* first line of the hook, and the line that closes it - both unique to this block */
 const HOOK_START = "  /* The client's wisp socket keeps its own reference to the native WebSocket, so replacing";
-const HOOK_END = "\n  })();";
+/* the block ends at its own marker rather than at the first `})();` after the start line: a hook
+   body that one day nests such a call would otherwise be sliced in half and the page half-edited,
+   and the guard count would not notice because it only counts what is left */
+const HOOK_CLOSE = "  /* end of the join hook */";
+const HOOK_END = `\n${HOOK_CLOSE}\n  })();`;
+/* pages patched before the marker existed end at the first closing line instead */
+const HOOK_END_LEGACY = "\n  })();";
 /* the re-entry guard the hook installs, used to prove there is exactly one copy */
 const HOOK_MARK = "proto.__wispcraftSrv = 1;";
 
@@ -113,6 +119,7 @@ const HOOK = `
         }
       }, function () { go(data); });
     };
+${HOOK_CLOSE}
   })();`;
 
 const argv = process.argv.slice(2);
@@ -142,13 +149,16 @@ try {
 const norm = (s) => String(s).replace(/\r\n/g, "\n").split("\n").map((l) => l.trim()).join("\n");
 const countOf = (haystack, needle) => haystack.split(needle).length - 1;
 
-/** the whole block, from its first comment line to the `})();` that closes it */
+/** the whole block, from its first comment line to the marker that closes it */
 function installedHook(source) {
   const at = source.indexOf(HOOK_START);
   if (at < 0) return null;
   const end = source.indexOf(HOOK_END, at);
-  if (end < 0) return { at, text: null };
-  return { at, text: source.slice(at, end + HOOK_END.length) };
+  if (end >= 0) return { at, text: source.slice(at, end + HOOK_END.length) };
+  /* an older copy, from before the hook carried its closing marker */
+  const legacy = source.indexOf(HOOK_END_LEGACY, at);
+  if (legacy < 0) return { at, text: null };
+  return { at, text: source.slice(at, legacy + HOOK_END_LEGACY.length) };
 }
 
 const found = installedHook(html);
