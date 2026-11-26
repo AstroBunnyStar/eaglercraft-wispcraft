@@ -231,21 +231,6 @@ async function walk(chrome) {
     /* Chrome's helpers can hold files for a moment after the kill, so a locked delete is retried */
     try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch (e) {}
   };
-  try {
-    server = await serve();
-    base = `http://127.0.0.1:${server.address().port}`;
-    const launched = await launch(chrome, profile);
-    child = launched.child;
-    if (!launched.port) throw new Error("Chrome never reported a debugging port");
-    const connection = await connect(launched.port);
-    ws = connection.ws;
-    send = connection.send;
-    logs = connection.logs;
-  } catch (err) {
-    died = true;
-    cleanup();
-    throw err;
-  }
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const say = (...a) => console.log(...a);
   fs.mkdirSync(OUT, { recursive: true });
@@ -308,6 +293,16 @@ async function walk(chrome) {
   })().catch((e) => "ERR " + e)`);
 
   try {
+    server = await serve();
+    base = `http://127.0.0.1:${server.address().port}`;
+    const launched = await launch(chrome, profile);
+    child = launched.child;
+    if (!launched.port) throw new Error("Chrome never reported a debugging port");
+    const connection = await connect(launched.port);
+    ws = connection.ws;
+    send = connection.send;
+    logs = connection.logs;
+
     await send("Runtime.enable", {});
     await send("Page.enable", {});
 
