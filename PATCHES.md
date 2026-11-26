@@ -288,6 +288,31 @@ eyes). Its `--check` mode is what CI runs: the picker's elements, the four notes
 and the one database both pages use, so a launcher edit that would strand the walk fails a push
 instead of being noticed months later.
 
+## The launcher inside `play.html` (`?servers=1`)
+
+`play.html` is the whole client: the built bundle, both payloads, and the launcher above. Opened
+with no query it boots straight into the game; `play.html?servers=1` shows the same picker as
+`index.html`, writes the picked row, and then starts the client **in that document** instead of
+loading a second page.
+
+The launcher is still authored in `index.html` - between the `<picker>`, `<picker-style>`, `<relay-probe>`
+and `<server-list>` markers - and `tools/build-single-file.mjs` lifts it into the page, so there is
+one copy of the picker, its styles and the writer, and a launcher fix needs no second edit. The build
+also holds the client's shell module as text (`<script type="text/plain" id="eagler-single-file-start">`)
+and inserts it only when the launcher hands over, which `handoff()` does through
+`window.__eaglerSingleFileHandoff` when that exists. The order matters twice over: the row has to be
+in `servers.dat` before the client reads that list, and the client's own splash and Wispcraft panels
+already sit at `z-index` 2147483646/7, so a picker pinned under them would be unclickable. Holding
+the start settles both, and costs what the two-page build already pays by loading `play.html` after
+the write.
+
+The picker is a `<dialog>` opened with `showModal()` - and closed when the launcher clears its `on`
+class, or on hand-off - because the top layer is the only place above those client panels. Its last
+note is copied onto the splash, since the panel is gone by then. Verified in Chrome from a fresh
+profile: `play.html?servers=1` -> picker over the splash -> **Play** on BlocksMC -> note -> client
+boots -> Multiplayer lists `ccc.blocksmc.com` (475/10000, live BlocksMC MOTD) -> **Join Server** ->
+in world; a plain `play.html` still boots directly.
+
 ## What is *not* in the bundle
 
 These survive a `wispcraft.js` swap and need no re-patching:

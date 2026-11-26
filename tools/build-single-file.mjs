@@ -22,6 +22,10 @@
  *      through XMLHttpRequest (not fetch), so the shim turns those two names into blob: URLs
  *      over the inline bytes and lets the browser do the transfer. The requested URL text never
  *      changes shape, so nothing else in the client has to know.
+ *   4. the launcher is folded in: the picker, its styles and both launcher scripts are lifted out
+ *      of index.html between their markers, and the client's shell module is held as text until the
+ *      picker hands over - so play.html?servers=1 picks a server and then boots the client in the
+ *      same document, and a plain play.html boots straight into the game.
  *
  * Exit codes: 0 built (or --check matched), 1 --check found a missing/stale play.html, 2 an
  * input is unusable.
@@ -100,6 +104,74 @@ const SHIM = `<script type="text/javascript">
     var args = Array.prototype.slice.call(arguments);
     if (inline) args[1] = inline;
     return open.apply(this, args);
+  };
+})();
+</script>
+`;
+
+/* The picker normally owns a black page of its own; in the single file it floats over the client,
+   so only the panel's own rules are reused (lifted from index.html) and this adds a modal layer,
+   a backdrop and the hint. It is a <dialog> rather than a z-index because the client's own splash
+   and account panels already sit at 2147483646/7 - the top layer is the only thing above that. */
+const OVERLAY_CSS = `  #eagler-launcher{position:fixed;inset:0;margin:0;padding:0;border:0;width:100vw;height:100vh;
+    max-width:none;max-height:none;background:transparent;overflow:visible;pointer-events:none;
+    font-family:ui-monospace,SFMono-Regular,"Cascadia Mono",Menlo,Consolas,monospace}
+  #eagler-launcher[open]{display:flex;align-items:center;justify-content:center}
+  #eagler-launcher::backdrop{background:rgba(0,0,0,.9)}
+  #eagler-launcher .hint{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);
+    max-width:min(94vw,560px);font-size:.76rem;color:#8a9c82;background:rgba(0,0,0,.6);
+    padding:3px 9px;border-radius:4px;text-align:center}
+  #eagler-launcher .hint:empty{display:none}
+  #eagler-launcher .servers{pointer-events:auto}
+  #eagler-launcher .servers.on{display:flex;flex-direction:column;gap:10px;
+    width:min(94vw,560px);color:#9fb596;background:#0a0f08;border:1px solid #22301c;
+    border-radius:8px;padding:14px 16px;box-shadow:0 18px 50px rgba(0,0,0,.6)}
+`;
+
+/* The client is in this same document but must not start until the launcher has decided: the picked
+   server has to be in servers.dat before the client reads that list, and the client's splash and
+   first-run panels outrank the picker - so holding the start settles both. The shell's module is
+   carried here as text and inserted on hand-off, which is the order the two-page build gets by
+   loading play.html only after the row is written. */
+const BOOT_GATE = `<script type="text/javascript">
+(function () {
+  "use strict";
+  var started = false;
+  var dialog = document.getElementById("eagler-launcher");
+  var panel = document.getElementById("servers");
+
+  /* the launcher opens and closes the picker by its class, so follow that class */
+  function sync() {
+    if (!dialog || !panel) return;
+    var open = (" " + panel.className + " ").indexOf(" on ") >= 0;
+    if (open && !dialog.open) {
+      try { dialog.showModal(); } catch (e) {}
+    } else if (!open && dialog.open) {
+      dialog.close();
+    }
+  }
+  if (panel && window.MutationObserver) {
+    new MutationObserver(sync).observe(panel, { attributes: true, attributeFilter: ["class"] });
+  }
+  sync();
+
+  window.__eaglerSingleFileHandoff = function () {
+    if (started) return;
+    started = true;
+    /* the picker's last note belongs on the splash, where it is still readable: the panel is gone
+       by now and the note is the only thing the player needs from it */
+    var note = document.getElementById("picksay");
+    var status = document.getElementById("boot_status");
+    if (note && status && note.textContent) status.textContent = note.textContent;
+    if (dialog && dialog.open) dialog.close();
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    var held = document.getElementById("eagler-single-file-start");
+    if (!held) return;
+    var shell = document.createElement("script");
+    shell.type = "module";
+    shell.textContent = held.textContent;
+    if (held.parentNode) held.parentNode.removeChild(held);
+    document.body.appendChild(shell);
   };
 })();
 </script>
@@ -186,6 +258,51 @@ let out = page.replace(WISP_TAG, `<script type="text/javascript">\n${bundle}\n</
 out = out.replace(SOUNDS_MARKER, payloadNode("eag-inline-sounds", sounds));
 out = out.replace(SHIM_ANCHOR, SHIM_ANCHOR + SHIM);
 
+/* ---------------------------------------------------------------- the launcher, in the same file */
+/* index.html is maintained in this checkout rather than generated, so the picker comes from the
+   working tree and not from --base: a launcher fix must not need a rebuild of main. The markers are
+   what both builds share; tools/walk-picker.mjs still drives the two-page flow. */
+const launcher = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
+const between = (start, end) => {
+  const at = launcher.indexOf(start);
+  if (at < 0) fail(`index.html has no ${start}`);
+  const to = launcher.indexOf(end, at + start.length);
+  if (to < 0) fail(`index.html's ${start} is never closed`);
+  return launcher.slice(at + start.length, to).trim();
+};
+const pickerStyle = between("/* <picker-style> */", "/* </picker-style> */");
+const pickerMarkup = between("<!-- <picker> -->", "<!-- </picker> -->");
+const launcherScripts = [...launcher.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)].map((m) => m[1]);
+if (launcherScripts.length !== 2) {
+  fail(`index.html should hold the relay probe and the launch controller, found ${launcherScripts.length} inline script(s)`);
+}
+for (const script of launcherScripts) {
+  if (/<\/script/i.test(script)) fail("a launcher script holds a </script sequence, so it cannot be inlined");
+}
+
+/* The shell's only entry point is its module: hold it instead of letting it run at parse time. Both
+   of the shell's compile paths and its single main() call stay untouched inside that text. */
+const SHELL_OPEN = '<script type="module">';
+if (count(out, SHELL_OPEN) !== 1) fail("expected exactly one <script type=\"module\"> shell to hold");
+const shellAt = out.indexOf(SHELL_OPEN);
+const shellBodyAt = shellAt + SHELL_OPEN.length;
+const shellEnd = out.indexOf("</script>", shellBodyAt);
+if (shellEnd < 0) fail("the shell module is never closed");
+const shell = out.slice(shellBodyAt, shellEnd);
+if (/<\/script/i.test(shell)) fail("the shell module holds a </script sequence, so it cannot be held as text");
+out = out.slice(0, shellAt) +
+  `<script type="text/plain" id="eagler-single-file-start">${shell}</script>` +
+  out.slice(shellEnd + "</script>".length);
+
+const bodyEnd = "\n</body>";
+if (count(out, bodyEnd) !== 1) fail("expected exactly one </body> to anchor the picker");
+out = out.replace(bodyEnd,
+  `\n<style>\n${OVERLAY_CSS}${pickerStyle}\n</style>\n` +
+  `<dialog id="eagler-launcher">\n${pickerMarkup}\n</dialog>\n` +
+  BOOT_GATE +
+  launcherScripts.map((script) => `<script type="text/javascript">\n${script}\n</script>\n`).join("") +
+  bodyEnd);
+
 /* Every inline classic script must still parse. This is the check that catches an insertion
    landing inside another script element: the module then dies at parse time and the page quietly
    starts fetching classes.wasm off the disk instead of decoding it from the document. */
@@ -209,6 +326,14 @@ if (count(out, "window.__eaglerSingleFileURL = function") !== 1) fail("the shim 
 /* The client still asks for assets.epk and sounds.epk by name; the shim answers both. */
 if (!out.includes('{ url: "assets.epk?v=') || !out.includes('{ url: "sounds.epk?v=')) {
   fail("the client no longer asks for assets.epk/sounds.epk, so the shim has nothing to answer");
+}
+/* The launcher: the shell is held as text, there is one picker, and both launcher scripts are in. */
+if (count(out, '<script type="text/plain" id="eagler-single-file-start">') !== 1) fail("the client shell was not held for the hand-off");
+if (count(out, 'id="eagler-launcher"') !== 1) fail("the picker did not land exactly once");
+if (count(out, 'id="picksay"') !== 1) fail("the picker's own markup did not come through");
+if (count(out, "window.__eaglerSingleFileHandoff = function") !== 1) fail("the hand-off gate did not land exactly once");
+if (!out.includes("window.WispRelays") || !out.includes("installRow(host)")) {
+  fail("the launcher scripts did not land in the page");
 }
 
 const bytes = Buffer.from(out, "utf8");
@@ -237,6 +362,7 @@ if (options.check) {
 fs.writeFileSync(options.out, bytes);
 console.log(`[bundle] wispcraft.js inlined (${size(bundle.length)} B)`);
 console.log(`[payload] sounds.epk inlined (${size(sounds.length)} B)`);
+console.log(`[launcher] picker, relay probe and launch controller inlined from index.html`);
 console.log(
   `[done] wrote ${path.relative(ROOT, options.out)} (${size(bytes.length)} B) - ` +
     `no wispcraft.js, no assets.epk and no sounds.epk needed next to it`,

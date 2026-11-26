@@ -16,6 +16,7 @@
   .hint{font-size:.76rem;min-height:1.2em;color:#6d7f66}
   a{color:#7fe04a}
   /* server directory: only on screen when the launcher is held (?servers=1) */
+  /* <picker-style> */
   .servers{display:none;width:min(94vw,560px);margin:2px 0 0;text-align:left}
   .servers.on{display:block}
   .addr{display:flex;gap:6px;margin-bottom:8px}
@@ -33,10 +34,12 @@
   .foot{display:flex;align-items:center;justify-content:space-between;gap:8px;
     margin:10px 0 0;font-size:.7rem;color:#5d6d57}
   .foot .say{min-height:1em;flex:1;text-align:left}
+  /* </picker-style> */
 </style>
 </head>
 <body>
   <div class="title">Eaglercraft 26.3</div>
+  <!-- <picker> -->
   <div class="hint" id="hint"></div>
   <!-- Server directory. A Java server picked here is resolved and written into the client's own
        server list by this page - as a Wisp row, the only shape that joins - before the tab is handed
@@ -55,6 +58,7 @@
       <button id="plain" type="button">Play without a server</button>
     </div>
   </div>
+  <!-- </picker> -->
   <noscript><a href="play.html">Play Eaglercraft</a></noscript>
 <script>
 /* <relay-probe> */
@@ -449,7 +453,12 @@ window.WispRelays = (function () {
       setTimeout(handoff, 1600);
     });
   }
-  function handoff() { location.replace(GAME); }
+  function handoff() {
+    /* a single-file build puts the client in this document: it answers here instead of loading one,
+       so the same controller serves both builds */
+    if (typeof window.__eaglerSingleFileHandoff === "function") return window.__eaglerSingleFileHandoff();
+    location.replace(GAME);
+  }
   function say(text) { if (hint && !leaving) hint.textContent = text; }
 
   /* ---- the picked server as a row ---------------------------------------------------------------
