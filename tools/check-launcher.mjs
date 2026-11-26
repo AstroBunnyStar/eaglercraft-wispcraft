@@ -14,7 +14,16 @@ import vm from "node:vm";
 
 const file = process.argv[2] || "index.html";
 const html = fs.readFileSync(file, "utf8");
-const blocks = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)].map((m) => m[1]);
+
+/* Only JavaScript blocks are parsed. A page also carries data in script elements - the single-file
+   build's base64 payloads (application/octet-stream), the client shell it holds until hand-off
+   (text/plain) - and parsing those as code fails a healthy page. */
+const JS_TYPES = new Set(["", "module", "text/javascript", "application/javascript", "text/ecmascript", "application/ecmascript"]);
+const blocks = [];
+for (const m of html.matchAll(/<script(?![^>]*\bsrc=)([^>]*)>([\s\S]*?)<\/script>/gi)) {
+  const type = (/\btype\s*=\s*"([^"]*)"/i.exec(m[1]) || [, ""])[1].trim().toLowerCase();
+  if (JS_TYPES.has(type)) blocks.push({ type, code: m[2] });
+}
 
 if (blocks.length === 0) {
   console.error(`[fail] ${file}: no inline <script> found`);
@@ -23,7 +32,10 @@ if (blocks.length === 0) {
 
 for (let i = 0; i < blocks.length; i++) {
   try {
-    new vm.Script(blocks[i]);
+    /* a module is parsed as the body of an async function, which keeps top-level await legal
+       without pulling in vm.SourceTextModule and the flag it needs on every supported Node */
+    const code = blocks[i].type === "module" ? `(async () => {\n${blocks[i].code}\n})` : blocks[i].code;
+    new vm.Script(code, { filename: `${file}#${i}` });
   } catch (err) {
     console.error(`[fail] ${file}: inline script ${i} does not parse: ${err.message}`);
     process.exit(1);
@@ -44,4 +56,9 @@ if (missing.length) {
   process.exit(1);
 }
 
-console.log(`[ok]   ${file}: ${blocks.length} inline script(s) parse, ${refs.length} reference(s) resolve`);
+const modules = blocks.filter((block) => block.type === "module").length;
+console.log(
+  `[ok]   ${file}: ${blocks.length} inline script(s) parse` +
+    (modules ? ` (${modules} module)` : "") +
+    `, ${refs.length} reference(s) resolve`,
+);
