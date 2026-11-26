@@ -1,0 +1,73 @@
+name: single file
+
+# The one-file client lives on this branch and nowhere else: main publishes the separate-files
+# client through Pages, and a repository has only one Pages site, so this one ships as a release
+# asset instead. Downloading it is enough to run it - the page carries the bundle, both EPK
+# payloads and the launcher, and it boots from a plain file:// copy.
+#
+# The asset is replaced in place on every push, so there is one download link that always means
+# "the current head of this branch" instead of a tag per build.
+
+on:
+  push:
+    branches: [single-file]
+    paths:
+      - play.html
+      - index.html
+      - tools/build-single-file.mjs
+      - tools/patch-play-srv-hook.mjs
+      - .github/workflows/single-file-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: single-file-release
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Tests
+        run: node --test
+
+      # the shipped page is what the tools build, and it carries the srv hook: publishing anything
+      # else would hand out a client that cannot dial a Java server through the relay
+      - name: The page is this build, and carries the srv hook
+        run: |
+          set -euo pipefail
+          node tools/build-single-file.mjs --check
+          node tools/patch-play-srv-hook.mjs --check
+
+      - name: Publish the one-file client
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=single-file-client
+          body=$(cat <<'NOTES'
+          One-file Eaglercraft Wispcraft client.
+
+          `eaglercraft.html` is `play.html` from the `single-file` branch: the client, both EPK
+          payloads and the launcher are inside it, so it needs nothing beside it. Download it and
+          open it in a browser - it boots from disk. Add `?servers=1` to the address to get the
+          server picker.
+
+          This asset is replaced on every push to the branch, so the link always serves its head.
+          NOTES
+          )
+          cp play.html eaglercraft.html
+          git tag -f "$tag" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$tag"
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --title "Single-file client" --notes "$body"
+          gh release edit "$tag" --notes "$body"
+          gh release upload "$tag" eaglercraft.html --clobber
