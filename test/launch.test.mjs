@@ -162,6 +162,14 @@ test("no relay answering still launches, without saving anything", async () => {
   assert.deepEqual(none.navigations, ["play.html"], "the game still starts");
 });
 
+test("a pinned server still launches when its row cannot be written", async () => {
+  /* no fetch and no indexedDB in this sandbox, so the SRV lookup throws before the write: that must
+     end in the hand-off, not in a launch held by a promise that was never made */
+  const pinned = run({ store: { wispcraft_pinned_java: "blocksmc.com" } });
+  await settle();
+  assert.deepEqual(pinned.navigations, ["play.html"], "the game is handed the tab");
+});
+
 test("a recent pass never starts the search", async () => {
   const cached = run({ store: { [VERDICT]: pass() } });
   await settle();
