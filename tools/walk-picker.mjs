@@ -20,12 +20,18 @@
  * to look at in the saved frames (see the step table it prints). That split is also why --check is
  * static: the launcher contract can be checked on every push, the canvas walk cannot.
  *
+ * servers.dat is read as latin1 text here and the assertions look for the row's own strings. Parsing
+ * it again would mean a third copy of the reader whose agreement with the client the unit tests
+ * already establish; the question this tool answers is only whether a real pick reaches the file.
+ *
  * Usage:
- *   node tools/walk-picker.mjs                 # the whole walk, screenshots in .tmp/walk
- *   node tools/walk-picker.mjs --check         # the contract the walk relies on, no browser
- *   node tools/walk-picker.mjs --out dir       # where the screenshots go
- *   node tools/walk-picker.mjs --keep-profile  # keep the temporary browser profile
- *   node tools/walk-picker.mjs --boot-wait 90  # seconds to wait for the client menu (default 90)
+ *   node tools/walk-picker.mjs          # the whole walk, frames in .tmp/walk
+ *   node tools/walk-picker.mjs --check  # the contract the walk relies on, no browser
+ *
+ * The temporary browser profile is deleted when the walk passes. When it fails, or dies before it
+ * can assert anything, the profile is left in place and its path printed: the client's database,
+ * its console output and whatever the last frame showed are then there to inspect rather than to
+ * reproduce from scratch.
  *
  * CHROME may name the browser binary; otherwise the common paths are tried.
  *
@@ -44,15 +50,11 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
-const argv = process.argv.slice(2);
-const opt = (name, fallback) => {
-  const i = argv.indexOf(name);
-  return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[i + 1] : fallback;
-};
-const checkOnly = argv.includes("--check");
-const keepProfile = argv.includes("--keep-profile");
-const OUT = path.resolve(opt("--out", path.join(ROOT, ".tmp/walk")));
-const BOOT_WAIT = Number(opt("--boot-wait", 90)) * 1000;
+const checkOnly = process.argv.includes("--check");
+const OUT = path.join(ROOT, ".tmp/walk");
+/* the client paints its loader, then its menu; the menu is up well inside this on a warm machine
+   and the canvas half is photographed anyway, so a slow boot costs frames, not a false pass */
+const BOOT_WAIT = 90000;
 
 /* ---- the canvas-side steps, measured on Eaglercraft 26.3 at 900x1000 --------------------- */
 const STEPS = {
@@ -216,12 +218,34 @@ function connect(port) {
 async function walk(chrome) {
   const problems = [];
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "wispcraft-walk-"));
-  const server = await serve();
-  const base = `http://127.0.0.1:${server.address().port}`;
-  const started = await launch(chrome, profile);
-  const child = started.child;
-  if (!started.port) throw new Error("Chrome never reported a debugging port");
-  const { ws, send, logs } = await connect(started.port);
+  let server = null, child = null, ws = null, send = null, logs = [], base = "";
+  let died = false;
+  /* a failed walk keeps its state: the profile is the only copy of what the client wrote, so it is
+     left on disk (and named) whenever the walk dies, and removed only once everything passed */
+  const cleanup = () => {
+    try { if (ws) ws.close(); } catch (e) {}
+    /* SIGKILL on Windows is TerminateProcess, which releases the profile's files at once */
+    try { if (child) child.kill("SIGKILL"); } catch (e) {}
+    try { if (server) server.close(); } catch (e) {}
+    if (died || problems.length) { console.log(`  profile kept at ${profile}`); return; }
+    /* Chrome's helpers can hold files for a moment after the kill, so a locked delete is retried */
+    try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch (e) {}
+  };
+  try {
+    server = await serve();
+    base = `http://127.0.0.1:${server.address().port}`;
+    const launched = await launch(chrome, profile);
+    child = launched.child;
+    if (!launched.port) throw new Error("Chrome never reported a debugging port");
+    const connection = await connect(launched.port);
+    ws = connection.ws;
+    send = connection.send;
+    logs = connection.logs;
+  } catch (err) {
+    died = true;
+    cleanup();
+    throw err;
+  }
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const say = (...a) => console.log(...a);
   fs.mkdirSync(OUT, { recursive: true });
@@ -245,12 +269,30 @@ async function walk(chrome) {
     await sleep(wait);
   };
   const nav = async (url) => { say(`  -> ${url}`); await send("Page.navigate", { url }); await sleep(1500); };
-  const databases = () => evaluate("indexedDB.databases ? indexedDB.databases().then(l => l.map(d => d.name)) : []");
 
-  /* the client's servers.dat, read through its own database; the row shape this returns is what the
-     assertions below look at, so it only understands the tags a server list holds */
+  /* poll a page-side condition; a timeout is a problem the caller does not have to report again */
+  const until = async (what, check, timeoutMs) => {
+    const t0 = Date.now();
+    for (;;) {
+      if (await check()) return true;
+      if (Date.now() - t0 > timeoutMs) {
+        problems.push(`${what} (gave up after ${Math.round(timeoutMs / 1000)}s)`);
+        return false;
+      }
+      await sleep(2000);
+    }
+  };
+  const hasFilesystem = async () => {
+    const dbs = await evaluate("indexedDB.databases ? indexedDB.databases().then(l => l.map(d => d.name)) : []");
+    const found = Array.isArray(dbs) && dbs.some((n) => String(n).includes("PlatformFilesystem_1_8_8_worlds"));
+    if (found) say("  client filesystem present");
+    return found;
+  };
+
+  /* the client's servers.dat as latin1 text: every string a pick writes is ASCII, and the row's
+     encoding itself is test/servers-dat.test.mjs's subject, not this tool's */
   const DB = databaseName(read("index.html"));
-  const readServers = () => evaluate(`(async () => {
+  const listText = () => evaluate(`(async () => {
     const open = await new Promise((res, rej) => { const o = indexedDB.open(${JSON.stringify(DB)}); o.onerror = () => rej(o.error); o.onsuccess = () => res(o.result); });
     const recs = await new Promise((res) => {
       const out = [];
@@ -262,42 +304,8 @@ async function walk(chrome) {
     const rec = recs.find((v) => v && v.path && /servers\\.dat$/.test(String(v.path)) && String(v.path).indexOf("_old") < 0);
     if (!rec) return null;
     const d = rec.data, b = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array(d.buffer || d);
-    let at = 1;
-    const u16 = () => { const v = (b[at] << 8) | b[at + 1]; at += 2; return v; };
-    const i32 = () => { const v = (b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]; at += 4; return v; };
-    const str = () => { const n = u16(); let s = ""; for (let i = 0; i < n; i++) s += String.fromCharCode(b[at + i]); at += n; return s; };
-    str(); at += 1; str();
-    const inner = b[at++], count = i32(), rows = [];
-    for (let k = 0; k < count; k++) {
-      const row = {};
-      for (;;) {
-        const t = b[at++];
-        if (t === 0) break;
-        const name = str();
-        if (t === 8) row[name] = str();
-        else if (t === 1) row[name] = b[at++];
-        else return "tag " + t + " in " + name;
-      }
-      rows.push(row);
-    }
-    return { bytes: b.length, inner, count, rows: rows.map((r) => ({ mode: r.connectionMode, ip: r.ip, name: r.name, hidden: r.hidden, icon: r.icon ? r.icon.length : 0 })) };
+    return new TextDecoder("latin1").decode(b);
   })().catch((e) => "ERR " + e)`);
-
-  const waitFilesystem = async (what, timeoutMs = 180000) => {
-    const t0 = Date.now();
-    for (;;) {
-      const dbs = await databases();
-      if (Array.isArray(dbs) && dbs.some((n) => String(n).includes("PlatformFilesystem_1_8_8_worlds"))) {
-        say(`  client filesystem after ${Math.round((Date.now() - t0) / 1000)}s`);
-        return true;
-      }
-      if (Date.now() - t0 > timeoutMs) {
-        problems.push(`${what}: the client never created its filesystem (${JSON.stringify(dbs)})`);
-        return false;
-      }
-      await sleep(2500);
-    }
-  };
 
   try {
     await send("Runtime.enable", {});
@@ -306,8 +314,7 @@ async function walk(chrome) {
     /* 1 ---- the client boots once, so its filesystem exists and the launcher has a list to write */
     say("[1] boot the client");
     await nav(`${base}/play.html`);
-    if (!(await waitFilesystem("first boot"))) return problems;
-    await sleep(3000);
+    if (!(await until("the client never created its filesystem", hasFilesystem, 180000))) return problems;
 
     /* 2 ---- the picker, on a page that is real DOM: no coordinates needed */
     say("[2] pick BlocksMC");
@@ -328,46 +335,47 @@ async function walk(chrome) {
     if (play.host !== "blocksmc.com") problems.push(`the first row is ${play.host}, not blocksmc.com`);
     logs.length = 0;
     await click(play.x, play.y, 0);
-    const notes = [];
-    for (let i = 0; i < 40; i++) {
-      const text = await evaluate(`(document.getElementById("picksay") || {}).textContent || ""`);
-      if (typeof text === "string" && text && notes[notes.length - 1] !== text) notes.push(text);
-      await sleep(40);
-    }
     await shot("note");
-    const said = notes.find((t) => /server list/.test(t)) || "";
+    /* read the footer inside the launcher's 1.6 s hold, in one round trip */
+    const notes = await evaluate(`(async () => {
+      const out = [];
+      for (let i = 0; i < 30; i++) {
+        const box = document.getElementById("picksay"), text = box ? box.textContent : "";
+        if (text && out[out.length - 1] !== text) out.push(text);
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      return out;
+    })()`);
+    const said = (Array.isArray(notes) ? notes : []).find((t) => /server list/.test(t)) || "";
     say(`  note: ${said || "(none)"}`);
-    if (!/added to your server list as a Wisp entry for \S+:\d+/.test(said) && !/now joins as a Wisp entry for \S+:\d+/.test(said)) {
-      problems.push(`the launcher said ${JSON.stringify(said || notes.join(" | "))}`);
+    if (!/added to your server list as a Wisp entry for \S+:\d+/.test(said) &&
+        !/now joins as a Wisp entry for \S+:\d+/.test(said)) {
+      problems.push(`the launcher said ${JSON.stringify(said || (Array.isArray(notes) ? notes.join(" | ") : notes))}`);
     }
-    for (let i = 0; i < 40; i++) {
-      if (String(await evaluate("location.pathname")) === "/play.html") break;
-      await sleep(250);
-    }
+    if (!(await until("the pick never handed the tab to play.html",
+      async () => String(await evaluate("location.pathname")) === "/play.html", 15000))) return problems;
     const landed = await evaluate("location.pathname + location.search");
     if (landed !== "/play.html") problems.push(`the hand-off went to ${landed}, not a plain play.html`);
-    await sleep(2500);
 
     /* 3 ---- the row the client will read */
     say("[3] servers.dat");
-    const list = await readServers();
-    say(`  ${JSON.stringify(list)}`);
-    if (!list || typeof list !== "object" || !Array.isArray(list.rows) || !list.rows.length) {
-      problems.push(`servers.dat could not be read back (${JSON.stringify(list)})`);
+    await until("servers.dat was not readable after the hand-off", async () => (await listText()) !== null, 20000);
+    const text = await listText();
+    if (typeof text !== "string" || /^(EXC|ERR)/.test(text)) {
+      problems.push(`servers.dat could not be read back (${String(text).slice(0, 120)})`);
     } else {
-      const row = list.rows[list.rows.length - 1];
+      /* the ip field's bytes end where the next tag's control byte starts, so stop at non-printable */
+      const ip = /eagler-wisp:[\x21-\x7e]+/.exec(text);
+      say(`  ${text.length} B, row ${ip ? decodeURIComponent(ip[0]) : "(none)"}`);
+      if (!ip) problems.push("servers.dat holds no wisp row");
       const wanted = /for (\S+):(\d+)/.exec(said);
-      if (row.mode !== "wisp") problems.push(`the row is ${row.mode}, not a wisp row`);
-      if (!/\?target=\S+:\d+$/.test(String(row.ip))) problems.push(`the row's ip is ${row.ip}`);
-      if (wanted && !String(row.ip).endsWith(`target=${wanted[1]}:${wanted[2]}`)) {
-        problems.push(`the row points at ${row.ip}, the note said ${wanted[1]}:${wanted[2]}`);
+      if (ip && wanted && !ip[0].endsWith(`?target=${wanted[1]}:${wanted[2]}`)) {
+        problems.push(`the row points at ${decodeURIComponent(ip[0])}, the note said ${wanted[1]}:${wanted[2]}`);
       }
-      if (wanted && row.name !== wanted[1]) problems.push(`the row is named ${row.name}, the note said ${wanted[1]}`);
     }
 
     /* 4 ---- the client on that list: Multiplayer -> row -> Join */
     say("[4] the client: Multiplayer, the row, Join");
-    if (!(await waitFilesystem("second boot"))) return problems;
     await sleep(BOOT_WAIT);
     await shot("menu");
     await click(...STEPS.closePanel, 600);
@@ -387,12 +395,11 @@ async function walk(chrome) {
     await shot("join-later");
     for (const line of logs.slice(-10)) say(`  client: ${line.slice(0, 160)}`);
     return problems;
+  } catch (err) {
+    died = true;
+    throw err;
   } finally {
-    try { ws.close(); } catch (e) {}
-    try { child.kill(); } catch (e) {}
-    server.close();
-    if (!keepProfile) { try { fs.rmSync(profile, { recursive: true, force: true }); } catch (e) {} }
-    else say(`profile kept at ${profile}`);
+    cleanup();
   }
 }
 
