@@ -68,16 +68,10 @@ and Chrome; they are for a real change to the picker or the relay code, not for 
   page hook rewrites the SRV CONNECT, and both are covered by tests.
 - Keep `tools/walk-picker.mjs --check` passing: it is the contract between the launcher and the walk.
 
-## Known drift to close (recorded 2026-11-26)
+## Where the parity came from (2026-11-26)
 
-`main`'s shared files are behind `single-file`'s by the `?servers=1` work:
-
-- `main:index.html` (21,826 B) has no picker, no `servers.dat` writer and no hand-off hook;
-  `single-file:index.html` (49,409 B) does.
-- `PATCHES.md` on `main` lacks the picker / row / launcher-in-page sections.
-- `test/servers-dat.test.mjs`, `tools/walk-picker.mjs`, `tools/patch-play-srv-hook.mjs` and the
-  `walk-picker --check` step in `verify.yml` exist only on `single-file`.
-
-Until that is ported, the Published site (`main`) has no server picker while the downloadable
-one-file client does. Porting it is a single shared-file move plus one rebuild of each branch's
-page — do it as one change, and delete this section in the same commit.
+The `?servers=1` picker grew on `single-file` while `main` kept an older launcher, so for a while
+the published site had no server directory and the download did. Both branches now carry the same
+`index.html`, the same tests and the same tools; the drift section that tracked it is gone with the
+commit that closed it. The lesson stands: a launcher edit is a shared-file edit, and the page that
+is built from it on `single-file` has to be rebuilt in the same session.

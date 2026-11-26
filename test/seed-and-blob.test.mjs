@@ -90,9 +90,11 @@ let head = null;
 function headScript() {
   if (head) return head;
   const html = fs.readFileSync(PLAY, "utf8");
-  const match = html.match(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/i);
-  assert.ok(match, "play.html has an inline head script");
-  head = match[1];
+  /* More than one inline script can sit in the page (the single-file build inlines the wispcraft
+     bundle ahead of this one), so pick the block that owns the seeding by what it does. */
+  const blocks = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)].map((m) => m[1]);
+  head = blocks.find((body) => body.includes("wispcraft_accounts") && body.includes("wispcraft_skin_reloaded"));
+  assert.ok(head, "play.html has the inline seeding script");
   assert.ok(head.length > 5000, "head script looks complete");
   return head;
 }

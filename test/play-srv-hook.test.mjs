@@ -11,10 +11,15 @@
  * frame that is not a CONNECT is never touched and a lookup that never answers still releases the
  * frame unchanged.
  *
+ * play.html is rebuilt from the payload, which drops local edits, so the last check also runs
+ * `tools/patch-play-srv-hook.mjs --check`: a page rebuilt without the hook (or with an older one)
+ * fails here instead of at a server join.
+ *
  * Run with: node --test
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import vm from "node:vm";
 
@@ -122,6 +127,11 @@ test("a lookup that never answers still releases the frame", async () => {
   await sleep(2600);
   check("the frame and its queue are released after the timeout",
     page.sent.length === 2 && hostOf(page.sent[0]).host === "slow.example.net", `${page.sent.length} frames`);
+});
+
+test("the tracked tool still finds the page's hook", () => {
+  const run = spawnSync(process.execPath, ["tools/patch-play-srv-hook.mjs", "--check"], { encoding: "utf8" });
+  check("the page carries the hook the tool applies", run.status === 0, `${run.stdout}${run.stderr}`);
 });
 
 test("only wisp CONNECT frames are looked at", async () => {
