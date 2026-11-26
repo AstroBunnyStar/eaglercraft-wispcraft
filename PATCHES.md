@@ -15,6 +15,11 @@ node tools/patch-wispcraft.mjs --check     # 1 = patch missing, 0 = good, 2 = bu
 node tools/patch-wispcraft.mjs             # applies whatever is missing (idempotent)
 node tools/patch-wispcraft.mjs --file path/to/other-copy.js
 node tools/patch-wispcraft.mjs --default-relay wss://relay.example/
+
+# after rebuilding play.html (the page-level SRV hook is a local edit, not part of the payload)
+node tools/patch-play-srv-hook.mjs --check    # 1 = hook missing or stale, 0 = good, 2 = anchor gone
+node tools/patch-play-srv-hook.mjs            # inserts it, or replaces an older copy (idempotent)
+node tools/patch-play-srv-hook.mjs --file path/to/other-play.html
 ```
 
 Then re-check the client still boots (launcher → Play, sign-in code appears). The script refuses
@@ -207,6 +212,107 @@ relay into `localStorage`, and the in-game override is **Wisp Settings → Wisp 
 The launcher default and the bundle fallback both come from `DEFAULT` in `index.html`, which is the one
 place to change.
 
+## Server directory (`index.html`, `?servers=1`)
+
+The one thing the HBW / Lunamix launcher (`skiingbeast2025/lunamix-eaglercraft`) had that this page
+did not is a list of servers in front of the game: theirs shows cards with the address on screen and
+a **Copy IP** button, and launches a client from them. `index.html?servers=1` is the same idea for
+our launcher, aimed at Java servers and the relay:
+
+- a picker with a custom address field, five known Java networks, **Copy IP** per entry and a
+  **Play without a server** escape hatch;
+- picking one resolves the SRV record over DNS-over-HTTPS and writes the row into the client's own
+  `servers.dat`, then hands the tab to a plain `play.html`. The row names the host the relay can
+  actually dial (`blocksmc.com` → `ccc.blocksmc.com`): a bare SRV-only domain otherwise times out at
+  the relay with code 1006;
+- the pick is remembered in `localStorage.wispcraft_pinned_java`, so later launches write the same
+  row without asking again.
+
+A pick now lands in Multiplayer **and joins from there**. The client's own `servers.dat` still wins
+over anything the page passes in `eaglercraftXOpts.servers`, so `index.html` writes the row into
+that file before handing the tab over — as the **Wisp** entry the client's own Add Server dialog writes, which
+is the only row shape that reaches a Java server (see *The picked server as a row* below). Verified
+end to end: `index.html?servers=1` → **Play** on BlocksMC → `[wispcraft] blocksmc.com added to your
+server list as a Wisp entry for ccc.blocksmc.com:25565` → Multiplayer lists `blocksmc.com` with a
+live BlocksMC status (236/10000 and its MOTD) → **Join Server** → in world.
+
+The launcher hand-off stays instant when there is nothing to report: only `?servers=1` holds the
+tab, and a launch with a row to add holds it for about a second and a half so the note can be read.
+That is why the picker is a URL and not the default screen — the page has no game to show while a
+player picks.
+
+## The picked server as a row (`index.html`, `servers.dat`)
+
+Three ways to hand the client a Java server were measured on a local build, and only the third joins:
+
+- `connectionMode: eaglerx` with `ip: wss://<host>` **shows** in Multiplayer, but the client dials it
+  as a direct EaglerX WebSocket (*Could not connect to direct EaglerX WebSocket*) and the page's
+  socket proxy never sees the dial, so no `wss://` row can be routed through the relay;
+- `ip: java://<host>:<port>` is dialled as `ws://java//<host>:<port>` by the same connector, again
+  without the proxy (`net::ERR_NAME_NOT_RESOLVED` for host `java`) — a java address in this file
+  does not mean what it means in `eaglercraftXOpts.servers`;
+- `connectionMode: wisp` with `ip: eagler-wisp:<percent-encoded wisp relay>?target=<host>:<port>` is
+  what the client's own **Add Server → Wisp** writes. The client dials the relay itself, the relay
+  opens the Java connection, and that row pings and joins with nothing from the page at all.
+
+The row is written in that third shape. The target is the host the SRV record points at: with the
+typed `blocksmc.com` the relay answers *Wisp destination host could not be reached (code 1006)*,
+which is the same failure the launcher's pre-boot SRV lookup exists to avoid. The relay comes from
+`WispRelays.current()`, so a player who switched relays keeps their row on the relay they chose.
+
+Writing the file is guarded rather than trusted. `servers.dat` is parsed into NBT tags and
+serialized again, and the result must equal the file byte for byte before anything is appended: a
+file this reader does not reproduce exactly (a future format, a damaged file, a different storage
+shape) is left untouched, and the note says the row was not added and gives the `host:port` to paste
+into **Direct Connection → Wisp**. The reader carries only the four tags such a list is made of -
+compound, list, string and byte - so a file holding anything else takes the same *not added* path
+instead of being rewritten by a reader that has not proved it understands it. A server the list already has is never duplicated: an entry that
+names it in an older mode (`wss://`, `java://`, or the typed name before the SRV target was known) is
+switched to the Wisp shape, keeping the player's name, hidden flag and icon; an entry that is
+already that Wisp row just reports itself.
+
+The writer lives in `index.html`, between the `<server-list>` markers, and runs before
+`location.replace("play.html")`. That is the whole point of the move: this branch ships `play.html`
+as the *output* of a build, so a writer edited into it is dropped by the next rebuild — it used to be
+six anchored patches in `tools/build-single-file.mjs`, and both are gone, so the generated page needs
+no patch at all. The launcher reuses the client page's SRV cache (`wispcraft_srv_cache`, same shape
+and six-hour TTL) and the same database guards, so the answer and the file it writes are the ones the
+client is about to read. `test/servers-dat.test.mjs` cuts the block out of the launcher and drives it
+against files shaped like the client's own: exact round trip, one row added with the client's rows
+byte-identical beside it, an older row switched instead of duplicated, and a file that does not round
+trip left alone. `tools/walk-picker.mjs` is the browser half of that proof: on a fresh profile it
+boots the client until its filesystem exists, clicks **Play** on BlocksMC, checks the note and the row
+it finds by reading `servers.dat` back out of the client's database, then drives Multiplayer -> row ->
+Join and saves a frame for each step (the canvas menus cannot be asserted, so those frames are for
+eyes). Its `--check` mode is what CI runs: the picker's elements, the four notes, the Wisp row shape
+and the one database both pages use, so a launcher edit that would strand the walk fails a push
+instead of being noticed months later.
+
+## The launcher inside `play.html` (`?servers=1`)
+
+`play.html` is the whole client: the built bundle, both payloads, and the launcher above. Opened
+with no query it boots straight into the game; `play.html?servers=1` shows the same picker as
+`index.html`, writes the picked row, and then starts the client **in that document** instead of
+loading a second page.
+
+The launcher is still authored in `index.html` - between the `<picker>`, `<picker-style>`, `<relay-probe>`
+and `<server-list>` markers - and `tools/build-single-file.mjs` lifts it into the page, so there is
+one copy of the picker, its styles and the writer, and a launcher fix needs no second edit. The build
+also holds the client's shell module as text (`<script type="text/plain" id="eagler-single-file-start">`)
+and inserts it only when the launcher hands over, which `handoff()` does through
+`window.__eaglerSingleFileHandoff` when that exists. The order matters twice over: the row has to be
+in `servers.dat` before the client reads that list, and the client's own splash and Wispcraft panels
+already sit at `z-index` 2147483646/7, so a picker pinned under them would be unclickable. Holding
+the start settles both, and costs what the two-page build already pays by loading `play.html` after
+the write.
+
+The picker is a `<dialog>` opened with `showModal()` - and closed when the launcher clears its `on`
+class, or on hand-off - because the top layer is the only place above those client panels. Its last
+note is copied onto the splash, since the panel is gone by then. Verified in Chrome from a fresh
+profile: `play.html?servers=1` -> picker over the splash -> **Play** on BlocksMC -> note -> client
+boots -> Multiplayer lists `ccc.blocksmc.com` (475/10000, live BlocksMC MOTD) -> **Join Server** ->
+in world; a plain `play.html` still boots directly.
+
 ## What is *not* in the bundle
 
 These survive a `wispcraft.js` swap and need no re-patching:
@@ -398,23 +504,38 @@ Three separate things had to line up, and each one was measured before it was be
    and puts the record's target on the wire before the frames queued behind it; a lookup that has not
    answered in 2.5 s releases the frame unchanged. Measured in the client: joining `minemen.club`
    logs `[wispcraft] srv minemen.club -> geo.minemen.club` and reaches Minemen's login stage, which
-   then reports that the server requires a Microsoft-authenticated account.
-2. **Transport** (patches 5 and 6). Quick Play hands the host to the client as a plain address, and
-   the client dials `wss://<host>` - an EaglerX socket no Java server answers ("connection dropped
-   without a WebSocket close frame (code 1006)"). The game's networking runs in a wasm worker, so a
-   page-level socket rewrite cannot move it: patch 5 still routes a matching `wss://` into the Wisp
-   stream for anything that does go through the page proxy, and patch 6 lets the launcher *supply*
-   the entry instead - `eaglercraftXOpts` is read at startup, and this setter (which already injects
-   `settings://`) appends `window.wispcraftJavaEntry`, surviving the client's own later assignment of
-   the same property.
-3. **The parameter itself.** `?server=<host>` resolves the record, publishes
-   `java://<srv target>:<port>`, and then drops the query with `history.replaceState`, because the
-   client would otherwise fire its EaglerX quick play at the same host on top of a working entry.
+   then reports that the server requires a Microsoft-authenticated account. Two more servers confirm
+   it is the record and not that one server: `blocksmc.com` -> `ccc.blocksmc.com` joins all the way
+   into the world, and `pika-network.net` -> `pika-network_net.pika.host` reaches Pika's own login
+   denial (its egress IP rule), both with the same one-line log note.
 
-What this cannot do: rewrite the server list of a profile that already has an entry for the same
-server. That list belongs to the client, the saved list wins over the supplied one, and a page cannot
-reach it - an older entry pointing at the bare domain keeps timing out until it is redirected to the
-SRV host once (Edit -> address -> Done, Wisp mode already selected).
+   Because the hook lives in the page - which is a rebuilt artifact - it is re-applied the same way
+   the bundle patches are: `tools/patch-play-srv-hook.mjs` holds the hook text, inserts it after the
+   `window.wispcraftNote` line, replaces an older copy, and `--check` fails if a rebuild dropped it
+   or left a different version. `test/play-srv-hook.test.mjs` drives the shipped page's hook and also
+   runs that `--check`, so a rebuild that loses the hook fails a test instead of a join.
+2. **Transport** (patch 5, and the row below). Quick Play hands the host to the client as a plain
+   address, and the client dials `wss://<host>` - an EaglerX socket no Java server answers
+   ("connection dropped without a WebSocket close frame (code 1006)"). The game's networking runs in
+   a wasm worker, so a page-level socket rewrite cannot move it: patch 5 still routes a matching
+   `wss://` into the Wisp stream for anything that does go through the page proxy. What actually
+   reaches a Java server is the client's own Wisp mode, so the launcher writes that row into
+   `servers.dat` before it hands the tab over (see *The picked server as a row*) instead of supplying
+   an entry through `eaglercraftXOpts`. Patch 6 is still in the bundle, but nothing publishes
+   `window.wispcraftJavaEntry` any more, so it appends nothing and prints nothing - measured, a
+   `java://` entry supplied that way was dialled as `ws://java//…` (native
+   `ERR_NAME_NOT_RESOLVED`), so the only row it produced could not join.
+3. **The parameter itself.** The launcher hands over a plain `play.html`, so a pick never travels in
+   the URL and the client's EaglerX quick play is not armed alongside the Wisp row. `?server=<host>`
+   still exists on the page (`play.html?server=minemen.club` resolves the record, publishes
+   `java://<srv target>:<port>` and drops the query with `history.replaceState`), but nothing in the
+   launcher produces one.
+
+What this cannot do: the row has to be in place before the client boots, so a browser that has never
+run the client has no filesystem to write into - that visit is told the address to paste into
+**Direct Connection → Wisp**, and the pick is remembered so the next launch adds the row. An older
+entry for the same server is *rewritten* by the same pass (bare domain, `wss://` or `java://` all
+become the Wisp row), so no hand editing is needed.
 ## Relay failover: switching at run time, checking the join (patches 8 and 9, `play.html`)
 
 `index.html` proves a relay can reach `example.com` and Microsoft, which says nothing about the game

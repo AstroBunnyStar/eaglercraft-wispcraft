@@ -35,9 +35,15 @@ jobs:
           node --check tools/make-legacy-fixtures.mjs
           node --check tools/verify-published.mjs
           node --check tools/probe-relay.mjs
+          node --check tools/walk-picker.mjs
 
       - name: Launcher inline script parses
         run: node tools/check-launcher.mjs
+
+      # the assumptions the browser walk (tools/walk-picker.mjs) relies on: picker ids, the four
+      # notes, the row shape, and the one database the launcher writes and the client reads
+      - name: Launcher pick matches its walk
+        run: node tools/walk-picker.mjs --check
 
       - name: Tests
         run: node --test
